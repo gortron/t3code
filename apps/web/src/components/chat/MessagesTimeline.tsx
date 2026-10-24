@@ -215,6 +215,7 @@ interface MessagesTimelineProps {
   onOpenTurnDiff?: (runId: RunId, filePath?: string) => void;
   onOpenThread: (threadId: OrchestrationV2TurnItem["threadId"]) => void;
   renderHtmlRender?: TimelineRowSharedState["renderHtmlRender"];
+  turnItemSource?: TimelineRowSharedState["turnItemSource"];
   parentThreadLink?: {
     readonly threadId: ThreadId;
     readonly title: string;
@@ -330,6 +331,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
   onOpenTurnDiff,
   onOpenThread,
   renderHtmlRender,
+  turnItemSource,
   parentThreadLink = null,
   workflowOpening = null,
   onForkFromRun,
@@ -934,6 +936,7 @@ const ConversationTimeline = memo(function ConversationTimeline({
     onOpenTurnDiff,
     onOpenThread,
     renderHtmlRender,
+    turnItemSource,
     workflowOpening,
     onForkFromRun,
     onRollbackCheckpoint,

@@ -479,17 +479,6 @@ export function isProviderNativeSubagentThread(
 
 export const IDLE_COMPACTION_TEXT = "/compact";
 
-/** The message the server records for the owner's feedback on an approval request. */
-export const approvalFeedbackMessageId = (requestId: string) =>
-  MessageId.make(`approval-feedback:${requestId}`);
-/** The message the server sends the agent with the owner's answers to its questions. */
-export const questionAnswerMessageId = (requestId: string) =>
-  MessageId.make(`async-answer:${requestId}`);
-/** The owner's answer to a request, written by the server under one of the ids above. */
-export const isRequestAnswerMessageId = (messageId: string) =>
-  messageId.startsWith(approvalFeedbackMessageId("")) ||
-  messageId.startsWith(questionAnswerMessageId(""));
-
 interface CompactionMessageFields {
   readonly role: string;
   readonly text: string;

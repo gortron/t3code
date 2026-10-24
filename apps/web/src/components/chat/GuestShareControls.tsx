@@ -112,8 +112,8 @@ function GuestShareDialog({
         <DialogHeader>
           <DialogTitle>Share with guest</DialogTitle>
           <DialogDescription>
-            The guest sees the thread as you do, with commands and file names but not their output.
-            Replies can still repeat what the agent read.
+            The guest sees the thread as you do, including command output and the agent&apos;s
+            reasoning. Each message they send waits for you.
           </DialogDescription>
         </DialogHeader>
         <DialogPanel>

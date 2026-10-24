@@ -2,7 +2,6 @@ import {
   GUEST_PENDING_ATTACHMENT_BYTES_LIMIT,
   GUEST_PENDING_MESSAGE_LIMIT,
   GUEST_RESOLVED_MESSAGE_LIMIT,
-  GUEST_SHARE_HISTORY_RUNS,
   type GuestMessageAttribution,
   type GuestMessageId,
   type OrchestrationMessageContext,
@@ -105,7 +104,6 @@ export function decideGuestShareCommand(input: {
   readonly thread: OrchestrationV2AppThread;
   readonly command: GuestShareCommand;
   readonly now: DateTime.Utc;
-  readonly latestRunOrdinal: number | null;
 }): Result.Result<OrchestrationV2AppThread, string> {
   const { thread, command, now } = input;
   const share = thread.guestShare ?? null;
@@ -120,10 +118,6 @@ export function decideGuestShareCommand(input: {
         host: command.host,
         createdAt: DateTime.formatIso(now),
         expiresAt: command.expiresAt,
-        historyStartRunOrdinal: Math.max(
-          0,
-          (input.latestRunOrdinal ?? 0) - (GUEST_SHARE_HISTORY_RUNS - 1),
-        ),
         guestName: null,
         messages: [],
       });

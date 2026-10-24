@@ -8,6 +8,7 @@ import {
   type GuestRedeemRequest,
   type GuestShareView,
   type GuestThreadModel,
+  type OrchestrationV2ThreadProjection,
   type ThreadGuestMessage,
   type ThreadGuestMessageStatus,
 } from "@t3tools/contracts";
@@ -15,6 +16,12 @@ import type { LegendListRef } from "@legendapp/list/react";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
+import {
+  deriveRunlessWorkStartedAt,
+  deriveThreadActivityRun,
+  deriveThreadStructureRuntime,
+} from "@t3tools/client-runtime/state/thread-execution";
+import { createQuestionHistoryProjector } from "@t3tools/client-runtime/state/thread-requests";
 import { ArrowUpIcon, PaperclipIcon, XIcon } from "lucide-react";
 import {
   createRef,
@@ -33,6 +40,7 @@ import { useStableCallback } from "~/hooks/useStableCallback";
 import { useTheme } from "~/hooks/useTheme";
 import { observeResize } from "~/lib/observeResize";
 import { cn } from "~/lib/utils";
+import { deriveActiveWorkStartedAt, derivePhase } from "~/session-logic";
 import type { ChatComposerHandle } from "../chat/ChatComposer";
 import { ComposerControl, ComposerControlIcon } from "../chat/ComposerControl";
 import type { ExpandedImagePreview } from "../chat/ExpandedImagePreview";
@@ -50,18 +58,17 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import {
   applyGuestStreamEvent,
-  deriveGuestActivity,
   formatGuestExpiry,
   guestAttachmentUrl,
-  guestAttachmentUrlsById,
+  createGuestAttachmentUrls,
   guestFilesProblem,
   initialGuestStreamState,
   inviteShareId,
   type GuestStreamState,
   parseGuestStreamEvent,
   unplacedGuestMessages,
-  visibleGuestItems,
 } from "./guestStream.logic";
+import { guestTurnItemSource } from "./guestTurnItemSource";
 
 interface GuestEntry {
   /** Unspent invite from the URL hash, if this load came from a link. */
@@ -255,11 +262,11 @@ function GuestSession({ shareId }: { readonly shareId: string }) {
     return <Notice title="This link has ended" detail="The owner stopped sharing this thread." />;
   }
   if (stream.view !== null) {
+    if (stream.projection === null) return <Notice title="Connecting..." />;
     return (
       <GuestThread
         view={stream.view}
-        runs={stream.runs}
-        items={stream.items}
+        projection={stream.projection}
         awaitingRowIds={stream.awaitingRowIds}
       />
     );
@@ -336,7 +343,6 @@ function NameForm({
 const GUEST_ENVIRONMENT_ID = EnvironmentId.make("guest");
 const NO_COMPOSER = createRef<ChatComposerHandle>();
 const NO_TURN_DIFFS: ReadonlyArray<never> = [];
-const NO_HANDOFF_RUNS: ReadonlyArray<never> = [];
 const NO_OPTIMISTIC_MESSAGES: ReadonlyArray<never> = [];
 const ignore = () => {};
 
@@ -346,33 +352,43 @@ const ignore = () => {};
  */
 function GuestThread({
   view: { shareId, title, expiresAt, messages, model },
-  runs,
-  items,
+  projection,
   awaitingRowIds,
 }: {
   readonly view: GuestShareView;
-  readonly runs: GuestStreamState["runs"];
-  readonly items: GuestStreamState["items"];
+  readonly projection: OrchestrationV2ThreadProjection;
   readonly awaitingRowIds: GuestStreamState["awaitingRowIds"];
 }) {
   // No ":" so the timeline finds no environment thread behind the key.
   const threadKey = `guest-${shareId}`;
   const listRef = useRef<LegendListRef | null>(null);
   const { resolvedTheme } = useTheme();
-  // The guest's own sent files load from the guest route; the owner's never reach this page.
-  // The compiler keeps the map until the items change, so entries are not rebuilt every render.
-  const visibleItems = visibleGuestItems(items, runs);
-  const attachmentUrlById = guestAttachmentUrlsById(shareId, visibleItems);
+  // The rest is what ChatView derives from the same projection.
+  const [projectQuestionHistory] = useState(() => createQuestionHistoryProjector());
+  const items = projectQuestionHistory(projection);
+  // Files load through the guest route.
+  const [attachmentUrls] = useState(() => createGuestAttachmentUrls(shareId));
+  // Expanded rows read detail and command output through the guest routes.
+  const [turnItemSource] = useState(() => guestTurnItemSource(shareId));
+  const attachmentUrlById = attachmentUrls(items);
   const entries = useIncrementalTimelineEntries(threadKey, {
-    visibleTurnItems: visibleItems,
+    visibleTurnItems: items,
     optimisticMessages: NO_OPTIMISTIC_MESSAGES,
     attachmentUrlById,
+    attempts: projection.attempts,
+    nodes: projection.nodes,
+    plans: projection.plans,
   });
   const openFile = useStableCallback((file: { readonly id: string }) =>
     openInNewTab(guestAttachmentUrl(shareId, file.id)),
   );
-  const activity = deriveGuestActivity(runs);
-  const runningRunId = activity.isWorking ? (activity.run?.runId ?? null) : null;
+  const activityRun = deriveThreadActivityRun(projection);
+  const runtime = deriveThreadStructureRuntime(projection);
+  const runlessWorkStartedAt = deriveRunlessWorkStartedAt(projection);
+  const isWorking = derivePhase(runtime) === "running" || runlessWorkStartedAt !== null;
+  const workStartedAt =
+    deriveActiveWorkStartedAt(activityRun, runtime, null) ?? runlessWorkStartedAt;
+  const runningRunId = runtime?.activeRunId ?? null;
   const follow = useTimelineFollow({
     legendListRef: listRef,
     composerRef: NO_COMPOSER,
@@ -385,7 +401,7 @@ function GuestThread({
     isServerThread: false,
     serverProjection: null,
     threadStatus: "live",
-    activeActivityRun: activity.run,
+    activeActivityRun: activityRun,
     activeRunningTurnId: runningRunId,
     timelineEntries: entries,
     timelineAnchorMessageId: null,
@@ -430,13 +446,13 @@ function GuestThread({
         <MessagesTimeline
           listRef={listRef}
           timelineEntries={entries}
-          isWorking={activity.isWorking}
-          activeTurnInProgress={activity.isWorking}
-          activeTurnStartedAt={activity.workStartedAt}
-          latestRun={activity.run}
+          isWorking={isWorking}
+          activeTurnInProgress={isWorking}
+          activeTurnStartedAt={workStartedAt}
+          latestRun={activityRun}
           runningRunId={runningRunId}
           turnDiffSummaries={NO_TURN_DIFFS}
-          runs={NO_HANDOFF_RUNS}
+          runs={projection.runs}
           routeThreadKey={threadKey}
           onOpenThread={ignore}
           onRollbackCheckpoint={ignore}
@@ -447,6 +463,7 @@ function GuestThread({
           onFileOpen={openFile}
           onFileDownload={openFile}
           renderHtmlRender={renderHtmlRender}
+          turnItemSource={turnItemSource}
           activeThreadEnvironmentId={GUEST_ENVIRONMENT_ID}
           markdownCwd={undefined}
           resolvedTheme={resolvedTheme}

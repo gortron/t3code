@@ -3,13 +3,17 @@ import { assert, it } from "@effect/vitest";
 import {
   ChatAttachmentId,
   CommandId,
+  EventId,
   GuestShareId,
   MessageId,
+  type OrchestrationV2TurnItem,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
+import * as DateTime from "effect/DateTime";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -32,12 +36,12 @@ import { CloudManagedEndpointRuntime } from "../cloud/ManagedEndpointRuntime.ts"
 import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+import * as CommandOutputHub from "../orchestration-v2/CommandOutputHub.ts";
 import * as EffectOutbox from "../orchestration-v2/EffectOutbox.ts";
 import * as EffectWorker from "../orchestration-v2/EffectWorker.ts";
 import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
-import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ResourceCleanupService from "../orchestration-v2/ResourceCleanupService.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
@@ -100,9 +104,12 @@ const layerCleanup = Layer.effect(
   }),
 ).pipe(Layer.provide(layerConfig), Layer.provide(NodeServices.layer));
 const layerTest = GuestShareService.layer.pipe(
-  Layer.provideMerge(layerOrchestration.pipe(Layer.provide(layerCleanup))),
+  Layer.provideMerge(
+    CommandOutputHub.layer.pipe(
+      Layer.provideMerge(layerOrchestration.pipe(Layer.provide(layerCleanup))),
+    ),
+  ),
   Layer.provide(layerProviders),
-  Layer.provide(ProjectStore.layer.pipe(Layer.provide(layerDatabase))),
   Layer.provide(layerConnect),
   Layer.provide(ServerSecretStore.layer),
   Layer.provideMerge(layerConfig),
@@ -155,15 +162,15 @@ it.effect("spends an invite once and ends the guest stream when the owner stops 
     });
     const received = Array.from(yield* Stream.runCollect(events));
     assert.deepEqual(
-      received.map((event) => event.type),
-      ["snapshot", "ended"],
+      received.map((event) => (event.type === "thread" ? event.item.kind : event.type)),
+      ["view", "snapshot", "ended"],
     );
     assert.isTrue(Exit.isFailure(yield* Effect.exit(guestShares.stream(session))));
     assert.isTrue(Exit.isFailure(yield* Effect.exit(guestShares.check(session))));
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("streams the runs and items the guest can see, then the same state on reconnect", () =>
+it.effect("streams the owner's thread events after the share and a snapshot", () =>
   Effect.gen(function* () {
     const { orchestrator, guestShares, credential } = yield* shareThread;
     const { token: session } = yield* guestShares.redeem({ credential, name: "Sam" });
@@ -185,16 +192,17 @@ it.effect("streams the runs and items the guest can see, then the same state on 
       threadId,
     });
     const received = Array.from(yield* Stream.runCollect(events));
-    assert.equal(received[0]?.type, "snapshot");
     assert.equal(received.at(-1)?.type, "ended");
-    // The run's updates in one batch arrive as one event.
-    assert.equal(received.filter((event) => event.type === "run").length, 1);
-    const message = received.flatMap((event) =>
-      event.type === "item" && event.item.type === "user_message" ? [event.item] : [],
+    const turnItems = received.flatMap((event) =>
+      event.type === "thread" &&
+      event.item.kind === "event" &&
+      event.item.event.type === "turn-item.updated"
+        ? [event.item.event.payload]
+        : [],
     );
     assert.deepEqual(
-      message.map((item) => [item.text, item.title, item.attachments]),
-      [["Fix the login bug", null, []]],
+      turnItems.flatMap((item) => (item.type === "user_message" ? [item.text] : [])),
+      ["Fix the login bug"],
     );
   }).pipe(Effect.provide(layerTest)),
 );
@@ -214,14 +222,16 @@ it.effect("starts a stream with the runs and items already in the thread", () =>
       createdBy: "user",
       creationSource: "web",
     });
-    const [snapshot] = Array.from(
-      yield* Stream.runCollect(Stream.take(yield* guestShares.stream(session), 1)),
+    const [view, snapshot] = Array.from(
+      yield* Stream.runCollect(Stream.take(yield* guestShares.stream(session), 2)),
     );
-    assert.equal(snapshot?.type, "snapshot");
-    if (snapshot?.type !== "snapshot") return;
-    assert.equal(snapshot.runs.length, 1);
+    assert.equal(view?.type, "view");
+    if (snapshot?.type !== "thread" || snapshot.item.kind !== "snapshot") {
+      return assert.fail("Expected the thread snapshot second.");
+    }
+    assert.equal(snapshot.item.projection.runs.length, 1);
     assert.include(
-      snapshot.items.map((item) => item.type),
+      snapshot.item.projection.visibleTurnItems.map((row) => row.item.type),
       "user_message",
     );
   }).pipe(Effect.provide(layerTest)),
@@ -273,8 +283,8 @@ it.effect("closes an open guest stream when T3 Connect stops serving the link's 
     // No `ended`: the browser reconnects, and the host check refuses it while Connect is gone.
     const received = Array.from(yield* Fiber.join(collecting));
     assert.deepEqual(
-      received.map((event) => event.type),
-      ["snapshot"],
+      received.map((event) => (event.type === "thread" ? event.item.kind : event.type)),
+      ["view", "snapshot"],
     );
     assert.isTrue(Exit.isFailure(yield* Effect.exit(guestShares.stream(session))));
     yield* Ref.set(hostname, "env.t3.test");
@@ -329,7 +339,7 @@ it.effect("refuses a message a page sends for a share the cookie no longer opens
   }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("serves no render for an item the guest's transcript does not show", () =>
+it.effect("serves no render for an item outside the shared thread", () =>
   Effect.gen(function* () {
     const { guestShares, credential } = yield* shareThread;
     const { token: session } = yield* guestShares.redeem({ credential, name: "Sam" });
@@ -338,6 +348,119 @@ it.effect("serves no render for an item the guest's transcript does not show", (
     assert.isTrue(
       Exit.isFailure(yield* Effect.exit(guestShares.render(credential, "item:missing"))),
     );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+/** A message from the owner, which opens a run for the command below. */
+const ownerRun = Effect.gen(function* () {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  yield* orchestrator.dispatch({
+    type: "message.dispatch",
+    commandId: CommandId.make("owner-message-for-command"),
+    threadId,
+    messageId: MessageId.make("message:command"),
+    text: "Build it",
+    attachments: [],
+    dispatchMode: { type: "defer_start" },
+    createdBy: "user",
+    creationSource: "web",
+  });
+  const { runs } = (yield* orchestrator.getThreadSnapshotWindow(threadId, { rowLimit: 10 }))
+    .projection;
+  return runs[0]!.id;
+});
+
+const writeCommand = (
+  id: string,
+  fields: Pick<
+    Extract<OrchestrationV2TurnItem, { type: "command_execution" }>,
+    "status" | "output"
+  >,
+) =>
+  Effect.gen(function* () {
+    const runId = yield* ownerRun;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const now = yield* DateTime.now;
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make(`event:${id}`),
+          type: "turn-item.updated",
+          threadId,
+          driver: ProviderDriverKind.make("codex"),
+          providerInstanceId: instanceId,
+          occurredAt: now,
+          payload: {
+            id: TurnItemId.make(id),
+            threadId,
+            runId,
+            nodeId: null,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            title: null,
+            startedAt: now,
+            completedAt: fields.status === "running" ? null : now,
+            updatedAt: now,
+            type: "command_execution",
+            input: "ls /work/src",
+            ...fields,
+          },
+        },
+      ],
+    });
+    return TurnItemId.make(id);
+  });
+
+it.effect("gives the guest a command's detail and output, as the owner's row loads them", () =>
+  Effect.gen(function* () {
+    const { guestShares, credential } = yield* shareThread;
+    const { token: session } = yield* guestShares.redeem({ credential, name: "Sam" });
+    const command = yield* writeCommand("item:command", {
+      status: "completed",
+      output: "/work/src/auth.ts\n",
+    });
+
+    const detail = (yield* guestShares.item(session, command)).item;
+    assert.deepInclude(detail, { input: "ls /work/src", output: "/work/src/auth.ts\n" });
+    const frames = Array.from(
+      yield* Stream.runCollect(yield* guestShares.commandOutput(session, command)),
+    );
+    assert.deepEqual(frames, [
+      { kind: "replace", text: "/work/src/auth.ts\n", truncated: false, running: false },
+    ]);
+    // Only with a session, and only for an item of this thread.
+    const refused: ReadonlyArray<Effect.Effect<unknown, GuestShareService.GuestShareAccessError>> =
+      [
+        guestShares.item(credential, command),
+        guestShares.commandOutput(credential, command),
+        guestShares.item(session, "item:elsewhere"),
+      ];
+    for (const request of refused) {
+      assert.isTrue(Exit.isFailure(yield* Effect.exit(request)));
+    }
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("ends a running command's output once the owner stops sharing", () =>
+  Effect.gen(function* () {
+    const { orchestrator, guestShares, credential } = yield* shareThread;
+    const { token: session } = yield* guestShares.redeem({ credential, name: "Sam" });
+    const command = yield* writeCommand("item:running", { status: "running" });
+    const collecting = yield* Stream.runCollect(
+      yield* guestShares.commandOutput(session, command),
+    ).pipe(Effect.forkChild);
+    yield* orchestrator.dispatch({
+      type: "thread.guest-share.close",
+      commandId: CommandId.make("close-during-command"),
+      threadId,
+    });
+    yield* TestClock.adjust("30 seconds");
+    const frames = Array.from(yield* Fiber.join(collecting));
+    assert.isTrue(frames.every((frame) => frame.running));
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(guestShares.commandOutput(session, command))));
   }).pipe(Effect.provide(layerTest)),
 );
 
@@ -595,30 +718,10 @@ it.effect("sends a guest's files as the guest's message and keeps them the guest
     }
     assert.isFalse((yield* waitingMessages).some((next) => next.id === message!.id));
     assert.equal((yield* guestShares.attachment(session, copied.id)).attachment.id, copied.id);
-
-    // A new link for someone else shows that message from history, but not its files.
-    const { url } = yield* guestShares.create({ threadId });
-    const next = yield* guestShares.redeem({
-      credential: url.slice(url.indexOf("#") + 1),
-      name: "Eve",
-    });
-    assert.equal(
-      (yield* Effect.flip(guestShares.attachment(next.token, copied.id))).reason,
-      "unavailable",
-    );
-    const snapshot = yield* guestShares
-      .stream(next.token)
-      .pipe(Effect.flatMap(Stream.runHead), Effect.map(Option.getOrThrow));
-    assert.equal(snapshot.type, "snapshot");
-    if (snapshot.type !== "snapshot") return;
-    const earlier = snapshot.items.find(
-      (item) => item.type === "user_message" && item.context?.guest?.guestMessageId === message!.id,
-    );
-    assert.deepInclude(earlier, { attachments: [] });
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );
 
-it.effect("never serves another share's files or the owner's to a guest", () =>
+it.effect("serves the shared thread's files to its guest, never another thread's", () =>
   Effect.gen(function* () {
     const { orchestrator, guestShares, session, shareId } = yield* joinedGuest;
     // Another thread's guest attaches a file.
@@ -664,7 +767,12 @@ it.effect("never serves another share's files or the owner's to a guest", () =>
       creationSource: "web",
     });
 
-    for (const id of [othersFile, ownerImage.id, "pending-missing"]) {
+    // The guest sees the thread as the owner does, files included.
+    assert.equal(
+      (yield* guestShares.attachment(session, ownerImage.id)).attachment.id,
+      ownerImage.id,
+    );
+    for (const id of [othersFile, "pending-missing"]) {
       const error = yield* Effect.flip(guestShares.attachment(session, id));
       assert.equal(error.reason, "unavailable");
     }

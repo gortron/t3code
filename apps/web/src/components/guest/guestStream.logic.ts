@@ -6,23 +6,24 @@ import {
   GuestStreamEvent,
   isProviderSendTurnSupportedImageMimeType,
   type GuestMessageId,
-  type GuestRun,
   type GuestShareView,
-  type GuestTurnItem,
   type OrchestrationV2ProjectedTurnItem,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   type ThreadGuestMessage,
 } from "@t3tools/contracts";
-import type { ThreadRunSummary } from "@t3tools/client-runtime/state/models";
-import { createOrchestrationV2TurnItemVisibility } from "@t3tools/shared/orchestrationV2Timeline";
+import { applyOrchestrationV2ProjectionEvent } from "@t3tools/client-runtime/state/orchestration-v2-projection";
+import { boundedSnapshotProjection } from "@t3tools/shared/orchestrationV2BoundedSnapshot";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 export interface GuestStreamState {
   readonly view: GuestShareView | null;
-  readonly runs: ReadonlyArray<GuestRun>;
-  /** In the shape the real timeline reads. A guest only ever gets this thread's own items. */
-  readonly items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>;
+  /** The thread as the owner's client holds it, built with the same reducer. */
+  readonly projection: OrchestrationV2ThreadProjection | null;
+  readonly sequence: number;
+  /** Set while the snapshot is a window of a longer history, as the owner's client tracks it. */
+  readonly partial: { readonly latestLocalTurnOrdinal: number | null } | null;
   readonly ended: boolean;
   /**
    * Messages this page saw waiting that have no transcript row yet. Survives reconnects, and a
@@ -33,38 +34,12 @@ export interface GuestStreamState {
 
 export const initialGuestStreamState: GuestStreamState = {
   view: null,
-  runs: [],
-  items: [],
+  projection: null,
+  sequence: 0,
+  partial: null,
   ended: false,
   awaitingRowIds: new Set(),
 };
-
-const projectedItem = (
-  item: GuestTurnItem,
-  position: number,
-): OrchestrationV2ProjectedTurnItem => ({
-  position,
-  visibility: "local",
-  sourceThreadId: item.threadId,
-  sourceItemId: item.id,
-  item,
-});
-
-/** Replaces the row with the item's id, or adds it at the end. Other rows keep their identity. */
-function upsertItem(
-  items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
-  item: GuestTurnItem,
-): ReadonlyArray<OrchestrationV2ProjectedTurnItem> {
-  const index = items.findIndex((row) => row.item.id === item.id);
-  return index === -1
-    ? [...items, projectedItem(item, items.length)]
-    : items.with(index, projectedItem(item, items[index]!.position));
-}
-
-function upsertRun(runs: ReadonlyArray<GuestRun>, run: GuestRun): ReadonlyArray<GuestRun> {
-  const index = runs.findIndex((existing) => existing.id === run.id);
-  return index === -1 ? [...runs, run] : runs.with(index, run);
-}
 
 const guestMessageIdOf = (item: OrchestrationV2TurnItem) =>
   item.type === "user_message" ? item.context?.guest?.guestMessageId : undefined;
@@ -80,7 +55,7 @@ function withPendingFrom(
 
 function withoutPlaced(
   awaiting: ReadonlySet<GuestMessageId>,
-  items: ReadonlyArray<GuestTurnItem>,
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
 ): ReadonlySet<GuestMessageId> {
   const placed = items.flatMap((item) => {
     const id = guestMessageIdOf(item);
@@ -92,119 +67,81 @@ function withoutPlaced(
   return next;
 }
 
-const decodeGuestStreamEvent = Schema.decodeUnknownOption(Schema.fromJsonString(GuestStreamEvent));
+const decodeGuestStreamEvent = Schema.decodeUnknownOption(
+  Schema.fromJsonString(Schema.toCodecJson(GuestStreamEvent)),
+);
 
 /** Returns null for anything the server would never send, so a bad frame is skipped, not fatal. */
 export const parseGuestStreamEvent = (data: string): GuestStreamEvent | null =>
   Option.getOrNull(decodeGuestStreamEvent(data));
 
 /**
- * A reconnect starts with a fresh snapshot, so `snapshot` replaces everything and later events
- * only patch what it delivered.
+ * Applies the owner's thread stream the way the owner's client does (see
+ * EnvironmentThreadState in client-runtime): a snapshot replaces the thread, and later events
+ * pass through the same projection reducer, once each.
  */
 export function applyGuestStreamEvent(
   state: GuestStreamState,
   event: GuestStreamEvent,
 ): GuestStreamState {
   switch (event.type) {
-    case "snapshot": {
-      // The page follows the share it names; a snapshot for another one means the link changed.
+    case "view":
+      // The page follows the share it names; a view of another one means the link changed.
       if (state.view !== null && state.view.shareId !== event.view.shareId) {
         return { ...state, ended: true };
       }
-      return {
-        view: event.view,
-        runs: event.runs,
-        items: event.items.map(projectedItem),
-        ended: false,
-        awaitingRowIds: withoutPlaced(
-          withPendingFrom(state.awaitingRowIds, event.view),
-          event.items,
-        ),
-      };
-    }
-    case "item":
-      return {
-        ...state,
-        items: upsertItem(state.items, event.item),
-        awaitingRowIds: withoutPlaced(state.awaitingRowIds, [event.item]),
-      };
-    case "run":
-      return { ...state, runs: upsertRun(state.runs, event.run) };
-    case "view":
       return {
         ...state,
         view: event.view,
         awaitingRowIds: withPendingFrom(state.awaitingRowIds, event.view),
       };
+    case "thread": {
+      const item = event.item;
+      if (item.kind === "snapshot") {
+        const projection = boundedSnapshotProjection(item);
+        return {
+          ...state,
+          projection,
+          sequence: item.snapshotSequence,
+          partial:
+            item.hasMoreHistory === true || (item.historyCursor ?? null) !== null
+              ? { latestLocalTurnOrdinal: item.latestLocalTurnOrdinal ?? null }
+              : null,
+          awaitingRowIds: withoutPlaced(
+            state.awaitingRowIds,
+            projection.visibleTurnItems.map((row) => row.item),
+          ),
+        };
+      }
+      if (item.kind === "synchronized" || item.sequence <= state.sequence) return state;
+      if (item.kind === "unknown-event") return { ...state, sequence: item.sequence };
+      const projection =
+        applyOrchestrationV2ProjectionEvent(
+          state.projection,
+          item.event,
+          state.partial === null ? undefined : { partialTimeline: true, ...state.partial },
+        ) ?? state.projection;
+      const turnItem = item.event.type === "turn-item.updated" ? item.event.payload : null;
+      const watermark = state.partial?.latestLocalTurnOrdinal ?? null;
+      return {
+        ...state,
+        projection,
+        sequence: item.sequence,
+        partial:
+          state.partial !== null &&
+          turnItem !== null &&
+          (watermark === null || turnItem.ordinal > watermark)
+            ? { latestLocalTurnOrdinal: turnItem.ordinal }
+            : state.partial,
+        awaitingRowIds:
+          turnItem === null
+            ? state.awaitingRowIds
+            : withoutPlaced(state.awaitingRowIds, [turnItem]),
+      };
+    }
     case "ended":
       return { ...state, ended: true };
   }
-}
-
-/**
- * The rows the owner's timeline would show: a rolled-back run's rows and a cancelled queued
- * message leave, as they do for the owner. Guests get no attempts, so only run status applies.
- */
-export function visibleGuestItems(
-  items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
-  runs: ReadonlyArray<GuestRun>,
-): ReadonlyArray<OrchestrationV2ProjectedTurnItem> {
-  const isVisible = createOrchestrationV2TurnItemVisibility({
-    runs,
-    attempts: [],
-    items: items.map((row) => row.item),
-  });
-  return items.filter((row) => isVisible(row.item));
-}
-
-const WORKING_RUN_STATUSES: ReadonlySet<GuestRun["status"]> = new Set([
-  "preparing",
-  "starting",
-  "running",
-  "waiting",
-]);
-
-export interface GuestActivity {
-  readonly isWorking: boolean;
-  /** The run the working row and turn folding follow, as the owner's timeline gets it. */
-  readonly run: ThreadRunSummary | null;
-  readonly workStartedAt: string | null;
-}
-
-/**
- * The newest working run, or else the newest run that left the queue. The same choice the owner's
- * view makes from its projection (see deriveThreadActivityRun).
- */
-export function deriveGuestActivity(runs: ReadonlyArray<GuestRun>): GuestActivity {
-  let working: GuestRun | null = null;
-  let latest: GuestRun | null = null;
-  for (const run of runs) {
-    if (
-      WORKING_RUN_STATUSES.has(run.status) &&
-      (working === null || run.ordinal > working.ordinal)
-    ) {
-      working = run;
-    }
-    if (run.status !== "queued" && (latest === null || run.ordinal > latest.ordinal)) latest = run;
-  }
-  const run = working ?? latest;
-  return {
-    isWorking: working !== null,
-    run:
-      run === null
-        ? null
-        : {
-            runId: run.id,
-            status: run.status,
-            requestedAt: run.requestedAt,
-            startedAt: run.startedAt,
-            completedAt: run.completedAt,
-            assistantMessageId: null,
-            ...(run.turnEnded ? { turnEnded: true } : {}),
-          },
-    workStartedAt: working?.workStartedAt ?? null,
-  };
 }
 
 /**
@@ -243,7 +180,7 @@ export function inviteShareId(credential: string): string | null {
   return shareId && signature ? shareId : null;
 }
 
-/** Where the guest page loads one of the guest's own files. */
+/** Where the guest page loads a file of the shared thread or of a waiting message. */
 export const guestAttachmentUrl = (shareId: string, attachmentId: string) =>
   `${GUEST_ATTACHMENT_ROUTE}?${GUEST_SHARE_PARAM}=${encodeURIComponent(shareId)}&id=${encodeURIComponent(attachmentId)}`;
 
@@ -271,18 +208,25 @@ export function guestFilesProblem(
     : null;
 }
 
-/** Image URLs for the guest's own sent messages, which the timeline shows as previews. */
-export function guestAttachmentUrlsById(
-  shareId: string,
-  items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>,
-): ReadonlyMap<string, string> {
-  return new Map(
-    items.flatMap(({ item }) =>
-      item.type === "user_message" && item.context?.guest !== undefined
-        ? item.attachments.map(
-            (attachment) => [attachment.id, guestAttachmentUrl(shareId, attachment.id)] as const,
-          )
-        : [],
-    ),
-  );
+/**
+ * Image URLs for the thread's messages, which the timeline shows as previews. The map keeps its
+ * identity while the rows do, because the timeline rebuilds its entries when it changes.
+ */
+export function createGuestAttachmentUrls(shareId: string) {
+  let previousItems: ReadonlyArray<OrchestrationV2ProjectedTurnItem> | null = null;
+  let previous: ReadonlyMap<string, string> = new Map();
+  return (items: ReadonlyArray<OrchestrationV2ProjectedTurnItem>): ReadonlyMap<string, string> => {
+    if (items === previousItems) return previous;
+    previousItems = items;
+    previous = new Map(
+      items.flatMap(({ item }) =>
+        item.type === "user_message"
+          ? item.attachments.map(
+              (attachment) => [attachment.id, guestAttachmentUrl(shareId, attachment.id)] as const,
+            )
+          : [],
+      ),
+    );
+    return previous;
+  };
 }

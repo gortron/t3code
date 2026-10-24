@@ -5,7 +5,6 @@ import {
   GuestMessageId,
   GuestShareId,
   IsoDateTime,
-  NonNegativeInt,
   ThreadId,
   TrimmedNonEmptyString,
   TrimmedString,
@@ -22,8 +21,6 @@ export const GUEST_NAME_MAX_LENGTH = 40;
 export const GUEST_PENDING_MESSAGE_LIMIT = 3;
 /** Resolved messages kept so the guest can see what happened to what they sent. */
 export const GUEST_RESOLVED_MESSAGE_LIMIT = 20;
-/** Completed runs before the invite that the guest can read. */
-export const GUEST_SHARE_HISTORY_RUNS = 3;
 /** Files a guest can attach to one message, and their total size. */
 export const GUEST_MESSAGE_MAX_ATTACHMENTS = 4;
 export const GUEST_MESSAGE_MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
@@ -49,8 +46,6 @@ export const ThreadGuestShare = Schema.Struct({
   host: TrimmedNonEmptyString,
   createdAt: IsoDateTime,
   expiresAt: IsoDateTime,
-  /** Runs with a lower ordinal stay hidden from the guest. */
-  historyStartRunOrdinal: NonNegativeInt,
   /** Set once, when the guest redeems the link. */
   guestName: Schema.NullOr(TrimmedNonEmptyString),
   messages: Schema.Array(ThreadGuestMessage),
@@ -128,10 +123,14 @@ export const GUEST_SHARE_PARAM = "share";
  * for one share never acts with another share's session.
  */
 export const guestSessionCookieName = (shareId: string) => `t3_guest_${shareId}`;
-/** Serves one HTML render the guest can see: `?share=<share id>&item=<turn item id>`. */
+/** Serves one HTML render in the shared thread: `?share=<share id>&item=<turn item id>`. */
 export const GUEST_RENDER_ROUTE = `${GUEST_ROUTE_PREFIX}/render`;
+/** One item of the shared thread, as an expanded row loads it: `?share=<share id>&item=<id>`. */
+export const GUEST_ITEM_ROUTE = `${GUEST_ROUTE_PREFIX}/item`;
+/** Server-sent output frames of one command in the shared thread: `?share=<share id>&item=<id>`. */
+export const GUEST_COMMAND_OUTPUT_ROUTE = `${GUEST_ROUTE_PREFIX}/command-output`;
 /**
- * A file the guest attached, from a waiting or sent message or a sent message's row:
- * `?share=<share id>&id=<attachment id>`. Images load inline; other files download.
+ * A file in the shared thread or a guest's waiting message: `?share=<share id>&id=<attachment id>`.
+ * Images load inline; other files download.
  */
 export const GUEST_ATTACHMENT_ROUTE = `${GUEST_ROUTE_PREFIX}/attachment`;

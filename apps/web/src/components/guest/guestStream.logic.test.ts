@@ -1,29 +1,28 @@
 import {
+  EventId,
   GuestMessageId,
   GuestShareId,
   MessageId,
+  ProviderDriverKind,
   RunId,
-  ThreadId,
   TurnItemId,
-  type GuestRun,
   type GuestShareView,
   type GuestStreamEvent,
-  type GuestTurnItem,
+  type OrchestrationV2TurnItem,
   type ThreadGuestMessage,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import { describe, expect, it } from "vite-plus/test";
 
+import { makeThreadProjectionFixture } from "../../test-fixtures";
 import {
   applyGuestStreamEvent,
-  deriveGuestActivity,
   formatGuestExpiry,
   guestFilesProblem,
   initialGuestStreamState,
   inviteShareId,
   parseGuestStreamEvent,
   unplacedGuestMessages,
-  visibleGuestItems,
   type GuestStreamState,
 } from "./guestStream.logic";
 
@@ -36,32 +35,35 @@ const view: GuestShareView = {
   model: { driver: null, name: "gpt-5.4" },
 };
 
+const projection = makeThreadProjectionFixture();
+const now = DateTime.makeUnsafe("2026-10-23T10:00:00.000Z");
+
 const base = {
-  threadId: ThreadId.make("thread"),
+  threadId: projection.thread.id,
   runId: RunId.make("run-1"),
   nodeId: null,
   providerThreadId: null,
   providerTurnId: null,
   nativeItemRef: null,
   parentItemId: null,
-  ordinal: 0,
+  ordinal: 1,
   status: "completed",
   title: null,
-  startedAt: null,
-  completedAt: null,
-  updatedAt: DateTime.makeUnsafe(0),
+  startedAt: now,
+  completedAt: now,
+  updatedAt: now,
 } as const;
 
-const reply = (id: string, text: string, streaming = false): GuestTurnItem => ({
+const reply = (id: string, text: string): OrchestrationV2TurnItem => ({
   ...base,
   id: TurnItemId.make(id),
   type: "assistant_message",
   messageId: MessageId.make(id),
   text,
-  streaming,
+  streaming: false,
 });
 
-const guestMessageRow = (id: string, guestMessageId: GuestMessageId): GuestTurnItem => ({
+const guestMessageRow = (id: string, guestMessageId: GuestMessageId): OrchestrationV2TurnItem => ({
   ...base,
   id: TurnItemId.make(id),
   type: "user_message",
@@ -74,85 +76,55 @@ const guestMessageRow = (id: string, guestMessageId: GuestMessageId): GuestTurnI
   attachments: [],
 });
 
-const run = (id: string, ordinal: number, status: GuestRun["status"]): GuestRun => ({
-  id: RunId.make(id),
-  ordinal,
-  status,
-  requestedAt: "2026-10-23T10:00:00.000Z",
-  startedAt: status === "queued" ? null : "2026-10-23T10:00:01.000Z",
-  completedAt: null,
-  workStartedAt: "2026-10-23T10:00:02.000Z",
-  turnEnded: false,
+const snapshot = (snapshotSequence = 1): GuestStreamEvent => ({
+  type: "thread",
+  item: { kind: "snapshot", snapshotSequence, projection },
 });
 
-const snapshot = (
-  items: ReadonlyArray<GuestTurnItem>,
-  overrides: Partial<Extract<GuestStreamEvent, { type: "snapshot" }>> = {},
-): GuestStreamEvent => ({ type: "snapshot", view, runs: [], items, ...overrides });
+const itemEvent = (sequence: number, item: OrchestrationV2TurnItem): GuestStreamEvent => ({
+  type: "thread",
+  item: {
+    kind: "event",
+    sequence,
+    event: {
+      id: EventId.make(`event-${sequence}`),
+      type: "turn-item.updated",
+      threadId: projection.thread.id,
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: projection.thread.providerInstanceId,
+      occurredAt: now,
+      payload: item,
+    },
+  },
+});
 
 const apply = (events: ReadonlyArray<GuestStreamEvent>, state = initialGuestStreamState) =>
   events.reduce<GuestStreamState>(applyGuestStreamEvent, state);
 
+const itemIds = (state: GuestStreamState) =>
+  state.projection?.visibleTurnItems.map((row) => row.item.id) ?? [];
+
 describe("applyGuestStreamEvent", () => {
-  it("replaces everything on snapshot, so a reconnect drops stale items and runs", () => {
-    const before = apply([
-      snapshot([reply("old", "stale")], { runs: [run("run-0", 1, "running")] }),
-      { type: "ended" },
-    ]);
-    const after = apply([snapshot([reply("a1", "hi")])], before);
-    expect(after.ended).toBe(false);
-    expect(after.runs).toEqual([]);
-    expect(after.items.map((row) => row.item.id)).toEqual(["a1"]);
+  it("builds the thread from the snapshot and applies each later event once", () => {
+    const once = apply([{ type: "view", view }, snapshot(1), itemEvent(2, reply("a1", "Hi"))]);
+    expect(itemIds(once)).toEqual(["a1"]);
+    // A replayed or older event changes nothing.
+    expect(apply([itemEvent(2, reply("a1", "Changed"))], once)).toBe(once);
   });
 
-  it("feeds the timeline local rows of this thread", () => {
-    const [row] = apply([snapshot([reply("a1", "hi")])]).items;
-    expect(row).toMatchObject({
-      visibility: "local",
-      sourceThreadId: "thread",
-      sourceItemId: "a1",
-      item: { type: "assistant_message", text: "hi" },
-    });
+  it("replaces the thread on a new snapshot, as after a reconnect", () => {
+    const before = apply([snapshot(1), itemEvent(2, reply("a1", "Hi")), { type: "ended" }]);
+    const after = apply([snapshot(1)], { ...before, ended: false });
+    expect(itemIds(after)).toEqual([]);
   });
 
-  it("ends when a snapshot names another link than the page's", () => {
+  it("ends when the view names another link than the page's", () => {
     const state = apply([
-      snapshot([]),
-      snapshot([], { view: { ...view, shareId: GuestShareId.make("share-2") } }),
+      { type: "view", view },
+      { type: "view", view: { ...view, shareId: GuestShareId.make("share-2") } },
     ]);
     expect(state.ended).toBe(true);
     expect(state.view?.shareId).toBe(view.shareId);
-  });
-
-  it("updates an item in place, adds new ones at the end, and keeps other rows as they were", () => {
-    const start = apply([snapshot([reply("a1", "Hel", true), reply("a2", "Next")])]);
-    const state = apply(
-      [
-        { type: "item", item: reply("a1", "Hello", false) },
-        { type: "item", item: reply("a3", "Last") },
-      ],
-      start,
-    );
-    expect(state.items.map((row) => [row.item.id, row.position])).toEqual([
-      ["a1", 0],
-      ["a2", 1],
-      ["a3", 2],
-    ]);
-    expect(state.items[0]?.item).toMatchObject({ text: "Hello", streaming: false });
-    // Unchanged rows keep their identity, so the timeline skips re-rendering them.
-    expect(state.items[1]).toBe(start.items[1]);
-  });
-
-  it("updates runs by id", () => {
-    const state = apply([
-      snapshot([], { runs: [run("run-1", 1, "completed")] }),
-      { type: "run", run: run("run-2", 2, "running") },
-      { type: "run", run: run("run-2", 2, "completed") },
-    ]);
-    expect(state.runs.map((guestRun) => [guestRun.id, guestRun.status])).toEqual([
-      ["run-1", "completed"],
-      ["run-2", "completed"],
-    ]);
   });
 
   it("remembers a waiting message across a reconnect until its row arrives", () => {
@@ -164,68 +136,15 @@ describe("applyGuestStreamEvent", () => {
     };
     const sent = { ...waiting, status: "sent" as const };
     const queued = apply([
-      snapshot([], { view: { ...view, messages: [waiting] } }),
-      snapshot([], { view: { ...view, messages: [sent] } }),
+      { type: "view", view: { ...view, messages: [waiting] } },
+      snapshot(1),
+      { type: "view", view: { ...view, messages: [sent] } },
     ]);
     expect([...queued.awaitingRowIds]).toEqual([waiting.id]);
 
     // Once placed, a later snapshot whose window no longer holds the row must not resurrect it.
-    const placed = apply(
-      [
-        { type: "item", item: guestMessageRow("u1", waiting.id) },
-        snapshot([], { view: { ...view, messages: [sent] } }),
-      ],
-      queued,
-    );
+    const placed = apply([itemEvent(2, guestMessageRow("u1", waiting.id)), snapshot(3)], queued);
     expect(placed.awaitingRowIds.size).toBe(0);
-  });
-
-  it("marks the stream ended", () => {
-    expect(apply([snapshot([]), { type: "ended" }]).ended).toBe(true);
-  });
-});
-
-describe("visibleGuestItems", () => {
-  it("drops a run's rows once the owner rolls it back", () => {
-    const state = apply([
-      snapshot([reply("a1", "kept"), { ...reply("a2", "undone"), runId: RunId.make("run-2") }], {
-        runs: [run("run-1", 1, "completed"), run("run-2", 2, "completed")],
-      }),
-      { type: "run", run: run("run-2", 2, "rolled_back") },
-    ]);
-    expect(visibleGuestItems(state.items, state.runs).map((row) => row.item.id)).toEqual(["a1"]);
-  });
-});
-
-describe("deriveGuestActivity", () => {
-  it("follows the newest working run, with when its work started", () => {
-    const activity = deriveGuestActivity([
-      run("run-1", 1, "completed"),
-      run("run-2", 2, "running"),
-      run("run-3", 3, "queued"),
-    ]);
-    expect(activity.isWorking).toBe(true);
-    expect(activity.run).toMatchObject({ runId: "run-2", status: "running" });
-    expect(activity.workStartedAt).toBe("2026-10-23T10:00:02.000Z");
-  });
-
-  it("passes on that the reply ended while the run still captures its checkpoint", () => {
-    const capturing = { ...run("run-1", 1, "waiting"), turnEnded: true };
-    expect(deriveGuestActivity([capturing]).run).toMatchObject({ turnEnded: true });
-  });
-
-  it("shows the newest run that left the queue when nothing works", () => {
-    const activity = deriveGuestActivity([
-      run("run-1", 1, "completed"),
-      run("run-2", 2, "interrupted"),
-      run("run-3", 3, "queued"),
-    ]);
-    expect(activity).toMatchObject({
-      isWorking: false,
-      run: { runId: "run-2", status: "interrupted" },
-      workStartedAt: null,
-    });
-    expect(deriveGuestActivity([]).run).toBeNull();
   });
 });
 
@@ -234,18 +153,6 @@ describe("parseGuestStreamEvent", () => {
     expect(parseGuestStreamEvent(JSON.stringify({ type: "ended" }))).toEqual({ type: "ended" });
     expect(parseGuestStreamEvent("{not json")).toBeNull();
     expect(parseGuestStreamEvent(JSON.stringify({ type: "unknown" }))).toBeNull();
-  });
-
-  it("decodes item dates for the timeline", () => {
-    const event = parseGuestStreamEvent(
-      JSON.stringify({
-        type: "item",
-        item: { ...reply("a1", "hi"), updatedAt: "2026-10-23T10:00:00.000Z" },
-      }),
-    );
-    expect(event?.type === "item" && DateTime.formatIso(event.item.updatedAt)).toBe(
-      "2026-10-23T10:00:00.000Z",
-    );
   });
 });
 
@@ -268,7 +175,15 @@ describe("unplacedGuestMessages", () => {
     const seen = new Set(
       ["placed", "queued", "dismissed", "late"].map((id) => GuestMessageId.make(id)),
     );
-    const { items } = apply([snapshot([guestMessageRow("u1", GuestMessageId.make("placed"))])]);
+    const items = [
+      {
+        position: 0,
+        visibility: "local" as const,
+        sourceThreadId: projection.thread.id,
+        sourceItemId: TurnItemId.make("u1"),
+        item: guestMessageRow("u1", GuestMessageId.make("placed")),
+      },
+    ];
     expect(unplacedGuestMessages(messages, items, seen).map((m) => m.id)).toEqual([
       "queued",
       "dismissed",

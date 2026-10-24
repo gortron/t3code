@@ -1,4 +1,6 @@
 import {
+  EventId,
+  GUEST_COMMAND_OUTPUT_ROUTE,
   GUEST_RENDER_ROUTE,
   GuestMessageId,
   GuestShareId,
@@ -6,9 +8,10 @@ import {
   MessageId,
   ProviderDriverKind,
   RunId,
-  ThreadId,
   TurnItemId,
-  type GuestTurnItem,
+  type GuestShareView,
+  type OrchestrationV2Run,
+  type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -18,31 +21,65 @@ import { userEvent } from "vite-plus/test/browser";
 import "~/index.css";
 
 import { render } from "../../../test/render";
+import { makeThreadProjectionFixture } from "../../test-fixtures";
 import { GuestPage } from "./GuestPage";
 
 const SHARE_ID = "share-1";
-const encodeEvent = Schema.encodeSync(Schema.fromJsonString(GuestStreamEvent));
+const encodeEvent = Schema.encodeSync(Schema.fromJsonString(Schema.toCodecJson(GuestStreamEvent)));
 
-const base = {
-  threadId: ThreadId.make("thread"),
-  runId: RunId.make("run-1"),
+const fixture = makeThreadProjectionFixture();
+const threadId = fixture.thread.id;
+const started = DateTime.makeUnsafe("2026-10-23T10:00:00.000Z");
+const finished = DateTime.makeUnsafe("2026-10-23T10:00:05.000Z");
+
+const run = (id: string, ordinal: number, status: OrchestrationV2Run["status"]) =>
+  ({
+    id: RunId.make(id),
+    threadId,
+    ordinal,
+    providerInstanceId: fixture.thread.providerInstanceId,
+    modelSelection: fixture.thread.modelSelection,
+    providerThreadId: null,
+    userMessageId: MessageId.make(`user-${id}`),
+    rootNodeId: null,
+    activeAttemptId: null,
+    status,
+    requestedAt: started,
+    startedAt: started,
+    completedAt: status === "running" ? null : finished,
+    checkpointId: null,
+    contextHandoffId: null,
+  }) satisfies OrchestrationV2Run;
+
+const itemBase = (id: string, ordinal: number, runId = "run-1") => ({
+  id: TurnItemId.make(id),
+  threadId,
+  runId: RunId.make(runId),
   nodeId: null,
   providerThreadId: null,
   providerTurnId: null,
   nativeItemRef: null,
   parentItemId: null,
-  status: "completed",
+  ordinal,
+  status: "completed" as const,
   title: null,
-  startedAt: DateTime.makeUnsafe("2026-10-23T10:00:00.000Z"),
-  completedAt: DateTime.makeUnsafe("2026-10-23T10:00:05.000Z"),
-  updatedAt: DateTime.makeUnsafe("2026-10-23T10:00:05.000Z"),
-} as const;
+  startedAt: started,
+  completedAt: finished,
+  updatedAt: finished,
+});
 
-const items: ReadonlyArray<GuestTurnItem> = [
+const reply = (id: string, ordinal: number, text: string, runId?: string) =>
+  ({
+    ...itemBase(id, ordinal, runId),
+    type: "assistant_message",
+    messageId: MessageId.make(id),
+    text,
+    streaming: false,
+  }) satisfies OrchestrationV2TurnItem;
+
+const items: ReadonlyArray<OrchestrationV2TurnItem> = [
   {
-    ...base,
-    id: TurnItemId.make("user"),
-    ordinal: 0,
+    ...itemBase("user", 0),
     type: "user_message",
     createdBy: "user",
     creationSource: "web",
@@ -51,70 +88,123 @@ const items: ReadonlyArray<GuestTurnItem> = [
     text: "Run the checks",
     attachments: [],
   },
+  // As the owner's stream sends it: the output loads when the row expands.
   {
-    ...base,
-    id: TurnItemId.make("command"),
-    ordinal: 1,
+    ...itemBase("command", 1),
     type: "command_execution",
     input: "vp run check:changed",
+    outputOmitted: true,
     exitCode: 0,
   },
   {
-    ...base,
-    id: TurnItemId.make("visual"),
-    ordinal: 2,
+    ...itemBase("visual", 2),
     type: "dynamic_tool",
     toolName: "mcp__t3-code__html_render",
     input: null,
     output: { htmlRender: { attachmentId: "thread-a-1", title: "Chart", height: 200 } },
   },
+  reply("reply", 3, "All checks pass."),
+];
+
+const view: GuestShareView = {
+  shareId: GuestShareId.make(SHARE_ID),
+  title: "Fix login",
+  guestName: "Sam",
+  expiresAt: "2026-10-24T10:00:00.000Z",
+  messages: [],
+  model: { driver: ProviderDriverKind.make("codex"), name: "GPT-5.4", shortName: "5.4" },
+};
+
+/** The stream's opening, as the server sends it: the share, then the owner's snapshot. */
+const opening = (
+  runs: ReadonlyArray<OrchestrationV2Run>,
+  turnItems: ReadonlyArray<OrchestrationV2TurnItem>,
+): ReadonlyArray<GuestStreamEvent> => [
+  { type: "view", view },
   {
-    ...base,
-    id: TurnItemId.make("reply"),
-    ordinal: 3,
-    type: "assistant_message",
-    messageId: MessageId.make("reply"),
-    text: "All checks pass.",
-    streaming: false,
+    type: "thread",
+    item: {
+      kind: "snapshot",
+      snapshotSequence: 1,
+      projection: {
+        ...fixture,
+        runs,
+        turnItems,
+        visibleTurnItems: turnItems.map((item, position) => ({
+          position,
+          visibility: "local",
+          sourceThreadId: threadId,
+          sourceItemId: item.id,
+          item,
+        })),
+      },
+    },
   },
 ];
 
-const snapshot = encodeEvent({
-  type: "snapshot",
-  view: {
-    shareId: GuestShareId.make(SHARE_ID),
-    title: "Fix login",
-    guestName: "Sam",
-    expiresAt: "2026-10-24T10:00:00.000Z",
-    messages: [],
-    model: { driver: ProviderDriverKind.make("codex"), name: "GPT-5.4", shortName: "5.4" },
-  },
-  runs: [
-    {
-      id: RunId.make("run-1"),
-      ordinal: 1,
-      status: "completed",
-      requestedAt: "2026-10-23T10:00:00.000Z",
-      startedAt: "2026-10-23T10:00:00.000Z",
-      completedAt: "2026-10-23T10:00:05.000Z",
-      workStartedAt: "2026-10-23T10:00:00.000Z",
-      turnEnded: false,
+/** One of the owner's thread events, numbered after the snapshot. */
+const threadEvent = (
+  sequence: number,
+  event:
+    | { readonly type: "turn-item.updated"; readonly payload: OrchestrationV2TurnItem }
+    | { readonly type: "run.updated"; readonly payload: OrchestrationV2Run },
+): GuestStreamEvent => {
+  const common = {
+    id: EventId.make(`event-${sequence}`),
+    threadId,
+    providerInstanceId: fixture.thread.providerInstanceId,
+    occurredAt: finished,
+  };
+  return {
+    type: "thread",
+    item: {
+      kind: "event",
+      sequence,
+      event:
+        event.type === "run.updated"
+          ? { ...common, type: "run.updated", runId: event.payload.id, payload: event.payload }
+          : {
+              ...common,
+              type: "turn-item.updated",
+              driver: ProviderDriverKind.make("codex"),
+              payload: event.payload,
+            },
     },
-  ],
-  items,
+  };
+};
+
+const finalOutput = JSON.stringify({
+  kind: "replace",
+  text: "4 files checked\n",
+  truncated: false,
+  running: false,
 });
 
-/** Delivers the snapshot as soon as the page subscribes. */
-class FakeEventSource extends EventTarget {
-  static readonly CLOSED = 2;
-  readyState = 1;
-  constructor(readonly url: string) {
-    super();
-    queueMicrotask(() => this.dispatchEvent(new MessageEvent("message", { data: snapshot })));
-  }
-  close() {
-    this.readyState = FakeEventSource.CLOSED;
-  }
+/**
+ * Delivers the opening as soon as the page subscribes, or a command's final output. `sources`
+ * collects the streams, so a test can send more events.
+ */
+function fakeEventSource(
+  events: ReadonlyArray<GuestStreamEvent>,
+  sources: Array<EventTarget> = [],
+) {
+  return class extends EventTarget {
+    static readonly CLOSED = 2;
+    readyState = 1;
+    constructor(readonly url: string) {
+      super();
+      sources.push(this);
+      const frames = url.startsWith(GUEST_COMMAND_OUTPUT_ROUTE)
+        ? [finalOutput]
+        : events.map((event) => encodeEvent(event));
+      queueMicrotask(() => {
+        for (const data of frames) this.dispatchEvent(new MessageEvent("message", { data }));
+      });
+    }
+    close() {
+      this.readyState = 2;
+    }
+  };
 }
 
 function visit(path: string): Disposable {
@@ -131,7 +221,9 @@ describe("GuestPage", () => {
     using _session = vi
       .spyOn(window, "fetch")
       .mockImplementation(async () => new Response(null, { status: 204 }));
-    using _stream = vi.spyOn(window, "EventSource").mockImplementation(FakeEventSource as never);
+    using _stream = vi
+      .spyOn(window, "EventSource")
+      .mockImplementation(fakeEventSource(opening([run("run-1", 1, "completed")], items)) as never);
     using socket = vi.spyOn(window, "WebSocket");
     const container = document.createElement("div");
     container.style.cssText = "height: 900px; width: 900px; display: flex; flex-direction: column;";
@@ -141,6 +233,9 @@ describe("GuestPage", () => {
     // A finished turn folds its work, as it does for the owner; the command is inside.
     await userEvent.click(screen.getByRole("button", { name: /Worked for/ }));
     await expect.element(screen.getByText("vp run check:changed")).toBeVisible();
+    // Expanding the command shows its output, read through the guest route.
+    await userEvent.click(screen.getByText("vp run check:changed"));
+    await expect.element(screen.getByText("4 files checked")).toBeVisible();
     await expect
       .element(screen.getByTitle("Chart"))
       .toHaveAttribute(
@@ -159,7 +254,9 @@ describe("GuestPage", () => {
     using fetchSpy = vi
       .spyOn(window, "fetch")
       .mockImplementation(async () => new Response(null, { status: 204 }));
-    using _stream = vi.spyOn(window, "EventSource").mockImplementation(FakeEventSource as never);
+    using _stream = vi
+      .spyOn(window, "EventSource")
+      .mockImplementation(fakeEventSource(opening([run("run-1", 1, "completed")], items)) as never);
     await using screen = await render(<GuestPage />);
 
     await expect.element(screen.getByLabelText("Attach files")).toBeVisible();
@@ -192,53 +289,18 @@ describe("GuestPage", () => {
       .mockImplementation(async () => new Response(null, { status: 204 }));
     const sources: Array<EventTarget> = [];
     // Enough turns that the thread overflows the page.
-    const longItems: ReadonlyArray<GuestTurnItem> = Array.from({ length: 12 }, (_, index) => ({
-      ...base,
-      id: TurnItemId.make(`reply-${index}`),
-      ordinal: index,
-      type: "assistant_message" as const,
-      messageId: MessageId.make(`reply-${index}`),
-      text: `Reply ${index}\n\n${"A long paragraph about the change. ".repeat(20)}`,
-      streaming: false,
-    }));
-    const view = {
-      shareId: GuestShareId.make(SHARE_ID),
-      title: "Fix login",
-      guestName: "Sam",
-      expiresAt: "2026-10-24T10:00:00.000Z",
-      messages: [],
-      model: { driver: null, name: "gpt-5.4" },
-    };
-    const run = {
-      id: RunId.make("run-1"),
-      ordinal: 1,
-      status: "running" as const,
-      requestedAt: "2026-10-23T10:00:00.000Z",
-      startedAt: "2026-10-23T10:00:00.000Z",
-      completedAt: null,
-      workStartedAt: "2026-10-23T10:00:00.000Z",
-      turnEnded: false,
-    };
-    using _stream = vi.spyOn(window, "EventSource").mockImplementation(
-      class extends EventTarget {
-        static readonly CLOSED = 2;
-        readyState = 1;
-        constructor() {
-          super();
-          sources.push(this);
-          queueMicrotask(() =>
-            this.dispatchEvent(
-              new MessageEvent("message", {
-                data: encodeEvent({ type: "snapshot", view, runs: [run], items: longItems }),
-              }),
-            ),
-          );
-        }
-        close() {
-          this.readyState = 2;
-        }
-      } as never,
+    const longItems = Array.from({ length: 12 }, (_, index) =>
+      reply(
+        `reply-${index}`,
+        index,
+        `Reply ${index}\n\n${"A long paragraph about the change. ".repeat(20)}`,
+      ),
     );
+    using _stream = vi
+      .spyOn(window, "EventSource")
+      .mockImplementation(
+        fakeEventSource(opening([run("run-1", 1, "running")], longItems), sources) as never,
+      );
     const send = (event: GuestStreamEvent) =>
       sources.at(-1)!.dispatchEvent(new MessageEvent("message", { data: encodeEvent(event) }));
     const container = document.createElement("div");
@@ -255,18 +317,19 @@ describe("GuestPage", () => {
     await expectAtEnd();
 
     // A new reply streams in at the end.
-    send({
-      type: "item",
-      item: {
-        ...base,
-        id: TurnItemId.make("reply-new"),
-        ordinal: 20,
-        type: "assistant_message",
-        messageId: MessageId.make("reply-new"),
-        text: `Newest reply\n\n${"More words as the agent writes. ".repeat(30)}`,
-        streaming: true,
-      },
-    });
+    send(
+      threadEvent(2, {
+        type: "turn-item.updated",
+        payload: {
+          ...reply(
+            "reply-new",
+            20,
+            `Newest reply\n\n${"More words as the agent writes. ".repeat(30)}`,
+          ),
+          streaming: true,
+        },
+      }),
+    );
     await expect.element(screen.getByText("Newest reply")).toBeInTheDocument();
     await expectAtEnd();
 
@@ -279,85 +342,57 @@ describe("GuestPage", () => {
     await expect.element(screen.getByRole("button", { name: /scroll to/i })).toBeVisible();
 
     // The guest's own message waits at the end for the owner.
-    send({
-      type: "view",
-      view: {
-        ...view,
-        messages: [
-          {
-            id: GuestMessageId.make("guest-1"),
-            text: "Can you also check the logout flow?",
-            status: "pending",
-            submittedAt: "2026-10-23T10:01:00.000Z",
-          },
-        ],
-      },
-    });
-    await expect
-      .element(screen.getByText("Can you also check the logout flow?"))
-      .toBeInTheDocument();
+    const waiting = {
+      id: GuestMessageId.make("guest-1"),
+      text: "Can you also check the logout flow?",
+      status: "pending" as const,
+      submittedAt: "2026-10-23T10:01:00.000Z",
+    };
+    send({ type: "view", view: { ...view, messages: [waiting] } });
+    await expect.element(screen.getByText(waiting.text)).toBeInTheDocument();
     await expectAtEnd();
 
     // The owner sends it: the run ends, the message becomes a row, and a new run's reply grows.
-    const sent = {
-      id: GuestMessageId.make("guest-1"),
-      text: "Can you also check the logout flow?",
-      status: "sent" as const,
-      submittedAt: "2026-10-23T10:01:00.000Z",
-    };
-    send({
-      type: "run",
-      run: {
-        ...run,
-        status: "completed",
-        completedAt: "2026-10-23T10:01:00.000Z",
-        turnEnded: true,
-      },
-    });
+    const sent = { ...waiting, status: "sent" as const };
+    send(threadEvent(3, { type: "run.updated", payload: run("run-1", 1, "completed") }));
     send({ type: "view", view: { ...view, messages: [sent] } });
-    const run2 = {
-      ...run,
-      id: RunId.make("run-2"),
-      ordinal: 2,
-      requestedAt: "2026-10-23T10:01:01.000Z",
-    };
-    send({ type: "run", run: run2 });
-    send({
-      type: "item",
-      item: {
-        ...base,
-        runId: RunId.make("run-2"),
-        id: TurnItemId.make("guest-row"),
-        ordinal: 30,
-        type: "user_message",
-        createdBy: "user",
-        creationSource: "web",
-        messageId: MessageId.make("guest-row"),
-        inputIntent: "turn_start",
-        text: "Message from guest Sam, sent by the owner: Can you also check the logout flow?",
-        attachments: [],
-        context: {
-          version: 1,
-          guest: { guestMessageId: sent.id, name: "Sam", text: sent.text },
-          records: [],
+    send(threadEvent(4, { type: "run.updated", payload: run("run-2", 2, "running") }));
+    send(
+      threadEvent(5, {
+        type: "turn-item.updated",
+        payload: {
+          ...itemBase("guest-row", 30, "run-2"),
+          type: "user_message",
+          createdBy: "user",
+          creationSource: "web",
+          messageId: MessageId.make("guest-row"),
+          inputIntent: "turn_start",
+          text: `Message from guest Sam, sent by the owner: ${sent.text}`,
+          attachments: [],
+          context: {
+            version: 1,
+            guest: { guestMessageId: sent.id, name: "Sam", text: sent.text },
+            records: [],
+          },
         },
-      },
-    });
+      }),
+    );
     await expectAtEnd();
-    for (const words of [10, 40, 120]) {
-      send({
-        type: "item",
-        item: {
-          ...base,
-          runId: RunId.make("run-2"),
-          id: TurnItemId.make("logout-reply"),
-          ordinal: 31,
-          type: "assistant_message",
-          messageId: MessageId.make("logout-reply"),
-          text: `Logout reply\n\n${"Checking the logout flow now. ".repeat(words)}`,
-          streaming: true,
-        },
-      });
+    for (const [index, words] of [10, 40, 120].entries()) {
+      send(
+        threadEvent(6 + index, {
+          type: "turn-item.updated",
+          payload: {
+            ...reply(
+              "logout-reply",
+              31,
+              `Logout reply\n\n${"Checking the logout flow now. ".repeat(words)}`,
+              "run-2",
+            ),
+            streaming: true,
+          },
+        }),
+      );
       await expectAtEnd();
       await expect.element(screen.getByText("Logout reply")).toBeInTheDocument();
     }

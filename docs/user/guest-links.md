@@ -22,15 +22,14 @@ unlinking the machine from T3 Connect also ends it. You can send or dismiss gues
 
 ## What the guest sees
 
-The guest sees the last three turns before you shared the thread and everything after, in the same
-timeline you see, as it streams. They see messages, plans, the agent's questions, and its work:
-commands, file names, searches, and tool names. Their composer shows the thread's model, but they
-cannot change it. They do not see command output, diffs, file contents, the agent's reasoning, or
-what you answer in approval prompts and the agent's questions. Paths in the workspace show as
-relative paths, and paths in your home folder start with `~`.
+The guest sees the thread's recent history and everything after, in the same timeline you see, as
+it streams: messages and their files, the agent's replies and reasoning, plans, questions, and its
+work, with command output when they expand a command. Their composer shows the thread's model, but
+they cannot change it. They do not see diffs, and they cannot act on the thread: no forking,
+reverting, opening files on your machine, or answering the agent for you.
 
-The agent's replies can still repeat something it read, such as a value from a file. Share only
-threads you are comfortable showing.
+Anything the agent read or printed can show, such as a value from a file. Share only threads you
+are comfortable showing.
 
 ## Guest attachments
 
