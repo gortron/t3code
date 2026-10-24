@@ -3905,6 +3905,7 @@ export const makeAcpAdapterV2 = Effect.fn("makeAcpAdapterV2")(function* (
                       ? {}
                       : { output: textFromUnknown(rawOutput) }),
                     ...(exitCode === undefined ? {} : { exitCode }),
+                    ...(inputVariant === "monitor" ? { monitor: true } : {}),
                   };
                 } else {
                   turnItem = {
