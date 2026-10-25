@@ -807,6 +807,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       orchestrationAdapter,
       textGeneration: makeUnsupportedTextGeneration(),
       acpSessionManagement: {
+        autoImportSessions: effectiveConfig.autoImportSessions,
         listSessions: ({ cwd, cursor }) =>
           provideAcpManagementServices(
             listAcpRegistrySessions({

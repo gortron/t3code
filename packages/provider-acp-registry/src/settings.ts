@@ -54,6 +54,15 @@ export const AcpRegistrySettings = makeProviderSettingsSchema(
         providerSettingsForm: { placeholder: "auto", clearWhenEmpty: "omit" },
       }),
     ),
+    autoImportSessions: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Automatically import sessions",
+        description:
+          "Periodically add sessions started outside T3 Code in your project folders as threads. Requires an agent that supports session listing.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
     distribution: AcpRegistryDistributionPreference.pipe(
       Schema.withDecodingDefault(Effect.succeed("auto")),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
@@ -64,7 +73,7 @@ export const AcpRegistrySettings = makeProviderSettingsSchema(
     ),
   },
   {
-    order: ["source", "agentId", "commandPath", "authMethodId"],
+    order: ["source", "agentId", "commandPath", "authMethodId", "autoImportSessions"],
   },
 );
 export type AcpRegistrySettings = typeof AcpRegistrySettings.Type;

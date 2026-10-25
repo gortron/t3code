@@ -529,6 +529,15 @@ const layerThreadPullRequestWorker = Layer.effectDiscard(
   ThreadPullRequestService.make.pipe(Effect.flatMap((service) => service.start())),
 ).pipe(Layer.provide(layerPullRequestService));
 
+// Session import launches threads through the startup command gate, so it
+// sits above the runtime services rather than among the core workers.
+const layerAcpSessionImport = Layer.effectDiscard(
+  Effect.gen(function* () {
+    const service = yield* AcpSessionImport.AcpSessionImport;
+    yield* service.start();
+  }),
+).pipe(Layer.provideMerge(AcpSessionImport.layer), Layer.provide(ProjectionStoreV2.layer));
+
 const layerProviderInstallationRefresh = Layer.effectDiscard(
   Effect.gen(function* () {
     const antigravity = yield* AntigravityInstallation.AntigravityInstallation;
@@ -1053,7 +1062,7 @@ const layerMakeServer = Layer.unwrap(
 
     return layerServerApplication.pipe(
       Layer.provide(CloudLink.layer.pipe(Layer.provideMerge(ConnectReachability.layer))),
-      Layer.provideMerge(AcpSessionImport.layer.pipe(Layer.provide(ProjectionStoreV2.layer))),
+      Layer.provideMerge(layerAcpSessionImport),
       Layer.provideMerge(layerRuntimeServices),
       Layer.provideMerge(
         McpSessionRegistry.layer.pipe(

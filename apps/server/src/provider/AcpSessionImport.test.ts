@@ -268,6 +268,175 @@ const scanFailure = Effect.fail(
 );
 
 describe("AcpSessionImport", () => {
+  it.effect("imports an external session into its project with server provenance", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+      yield* Ref.set(harness.listed, [session("external-1")]);
+
+      yield* harness.service.sweep;
+
+      const threadId = importedThread("external-1");
+      assert.deepStrictEqual(yield* harness.threads, [threadId]);
+      const thread = yield* harness.projections.getThread(threadId);
+      assert.strictEqual(thread.projectId, projectId);
+      assert.strictEqual(thread.title, "Session external-1");
+      assert.strictEqual(thread.createdBy, "system");
+      assert.strictEqual(thread.creationSource, "server");
+      assert.deepStrictEqual(yield* Queue.takeAll(harness.scans), [[projectRoot]]);
+    }),
+  );
+
+  it.effect.each([
+    ["without session listing", { canList: false, canLoad: true, canResume: true }],
+    ["that has not been probed", undefined],
+  ] as const)("does not scan an instance %s", ([, nativeSessions]) =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({ nativeSessions }));
+      yield* Ref.set(harness.listed, [session("external-1")]);
+
+      yield* harness.service.sweep;
+
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 0);
+      assert.deepStrictEqual(yield* harness.threads, []);
+    }),
+  );
+
+  it.effect("does not scan an instance with auto-import turned off", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({ autoImportSessions: false }));
+      yield* Ref.set(harness.listed, [session("external-1")]);
+
+      yield* harness.service.sweep;
+
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 0);
+      assert.deepStrictEqual(yield* harness.threads, []);
+    }),
+  );
+
+  it.effect("does not scan while no client wants opportunistic background work", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+      yield* Ref.set(harness.opportunistic, false);
+
+      yield* harness.service.sweep;
+
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 0);
+    }),
+  );
+
+  it.effect("never duplicates sessions T3 already knows", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+      yield* Ref.set(harness.listed, [session("previously-imported")]);
+      yield* harness.service.sweep;
+      const [previouslyImported] = yield* harness.threads;
+
+      const t3Created = yield* createThread(harness, "thread:t3-created");
+      yield* harness.bindNativeSession({
+        threadId: t3Created,
+        providerThreadId: ProviderThreadId.make("provider-thread:t3-created"),
+        nativeId: "t3-created",
+      });
+      const deleted = yield* createThread(harness, "thread:deleted");
+      yield* harness.bindNativeSession({
+        threadId: deleted,
+        providerThreadId: ProviderThreadId.make("provider-thread:deleted"),
+        nativeId: "deleted",
+      });
+      yield* deleteThread(harness, deleted);
+      yield* Ref.set(harness.listed, [
+        session("previously-imported"),
+        session("t3-created"),
+        session("deleted"),
+      ]);
+
+      yield* harness.service.sweep;
+      yield* harness.service.sweep;
+
+      assert.deepStrictEqual(
+        (yield* harness.threads).toSorted(),
+        [previouslyImported!, t3Created].toSorted(),
+      );
+    }),
+  );
+
+  it.effect("skips sessions outside every project root", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+      yield* Ref.set(harness.listed, [
+        session("subdirectory", `${projectRoot}/packages/app`),
+        session("elsewhere", "/work/other"),
+        session("root", `${projectRoot}/`),
+      ]);
+
+      yield* harness.service.sweep;
+
+      assert.deepStrictEqual(yield* harness.threads, [importedThread("root")]);
+    }),
+  );
+
+  it.effect("keeps an imported thread when its session disappears from the agent", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+      yield* Ref.set(harness.listed, [session("vanishing")]);
+      yield* harness.service.sweep;
+
+      yield* Ref.set(harness.listed, []);
+      yield* harness.service.sweep;
+
+      assert.deepStrictEqual(yield* harness.threads, [importedThread("vanishing")]);
+    }),
+  );
+
+  it.effect("backs off an instance whose scans keep failing", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+      const failingSweep = Ref.set(harness.nextScan, scanFailure).pipe(
+        Effect.andThen(harness.service.sweep),
+      );
+
+      yield* failingSweep;
+      yield* TestClock.adjust(pollInterval);
+      yield* failingSweep;
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 2);
+
+      yield* TestClock.adjust(pollInterval);
+      yield* harness.service.sweep;
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 2);
+
+      yield* TestClock.adjust(pollInterval);
+      yield* Ref.set(harness.listed, [session("after-recovery")]);
+      yield* harness.service.sweep;
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 3);
+      assert.deepStrictEqual(yield* harness.threads, [importedThread("after-recovery")]);
+
+      yield* harness.service.sweep;
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 4);
+    }),
+  );
+
+  it.effect("sweeps once at start and again after each background refresh interval", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness;
+      yield* harness.setInstance(harness.makeInstance({}));
+
+      yield* harness.service.start();
+      yield* Queue.take(harness.scans);
+      yield* TestClock.adjust(pollInterval);
+      yield* Queue.take(harness.scans);
+
+      assert.strictEqual(yield* Ref.get(harness.scanCount), 2);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("lists a T3-created session as already in T3 and refuses to import it again", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness;
