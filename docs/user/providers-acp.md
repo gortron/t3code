@@ -97,6 +97,13 @@ choose a project, and select **List sessions**. Importing one creates a determin
 backed by that native session. Importing the same agent session again returns the existing thread,
 including when another client performs the import.
 
+To skip the manual step, turn on **Automatically import sessions** in the agent's provider
+settings. While a client is connected, T3 Code then checks the agent as often as its provider health
+check under **Background Activity** and adds a thread for every session in one of your project
+folders that T3 Code does not already have, however old. Sessions started in a subfolder or a
+worktree of a project are not imported. Deleting an imported thread keeps that session out, and
+turning the switch off stops the checks without removing threads already added.
+
 The thread keeps the native session's title and last-update value as provider metadata without
 overwriting a title you set in T3 Code. Agents that report ACP context usage drive the composer's
 context meter and cumulative cost metadata. Text resources and links render as assistant output;

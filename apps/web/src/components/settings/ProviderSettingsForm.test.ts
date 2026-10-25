@@ -39,6 +39,20 @@ describe("ProviderSettingsForm helpers", () => {
     expect(next).toEqual({ forkOwned: 1 });
   });
 
+  it("offers session auto-import for local ACP commands", () => {
+    const acpRegistry = providerClients.get(ProviderDriverKind.make("acpRegistry"));
+    expect(acpRegistry).toBeDefined();
+
+    const fields = deriveProviderSettingsFields(acpRegistry!, { source: "local" });
+
+    expect(fields.map((field) => field.key)).toEqual([
+      "source",
+      "commandPath",
+      "autoImportSessions",
+    ]);
+    expect(fields.at(-1)).toMatchObject({ control: "switch", defaultBooleanValue: false });
+  });
+
   it("stores false boolean fields when true is the default", () => {
     const next = nextProviderConfigWithFieldValue(
       undefined,
