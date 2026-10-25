@@ -1161,9 +1161,10 @@ export class AcpSessionRuntime extends Context.Service<
       sessionId: string,
       options?: AcpSessionActivationOptions,
     ) => Effect.Effect<AcpSessionRuntimeStartResult, EffectAcpErrors.AcpError>;
-    readonly listSessions: (
-      cursor?: string,
-    ) => Effect.Effect<EffectAcpSchema.ListSessionsResponse, EffectAcpErrors.AcpError>;
+    readonly listSessions: (input?: {
+      readonly cwd?: string;
+      readonly cursor?: string;
+    }) => Effect.Effect<EffectAcpSchema.ListSessionsResponse, EffectAcpErrors.AcpError>;
     readonly closeSession: (
       sessionId?: string,
     ) => Effect.Effect<EffectAcpSchema.CloseSessionResponse, EffectAcpErrors.AcpError>;
@@ -2469,10 +2470,10 @@ export const make = Effect.fn("AcpSessionRuntime.make")(function* (
         }),
         Effect.flatMap((response) => adoptSession(response.sessionId, response)),
       ),
-    listSessions: (cursor) => {
+    listSessions: (input) => {
       const requestPayload = {
-        cwd: options.cwd,
-        ...(cursor === undefined ? {} : { cursor }),
+        cwd: input?.cwd ?? options.cwd,
+        ...(input?.cursor === undefined ? {} : { cursor: input.cursor }),
       } satisfies EffectAcpSchema.ListSessionsRequest;
       return initialize.pipe(
         Effect.filterOrFail(

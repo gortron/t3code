@@ -3,6 +3,7 @@ import {
   AcpRegistryOperationError,
   AcpRegistryListSessionsResult,
   AcpRegistryProbeResult,
+  type AcpRegistrySession,
   type AcpRegistryProbeAuthMethod,
   type AcpRegistryProbeModel,
   type AcpRegistryUrlAuthAction,
@@ -11,6 +12,7 @@ import {
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "../settings.ts";
+import type * as Arr from "effect/Array";
 import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -586,43 +588,50 @@ function managementFailure(
     : new AcpRegistryOperationError({ ...failure, cause: error });
 }
 
+function normalizeAcpRegistrySessions(
+  sessions: EffectAcpSchema.ListSessionsResponse["sessions"],
+): Array<AcpRegistrySession> {
+  return sessions.flatMap((session) => {
+    const sessionId = boundedOpaqueValue(session.sessionId, 1_024);
+    const cwd = boundedOpaqueValue(session.cwd, 4_096);
+    if (sessionId === undefined || cwd === undefined) return [];
+    return [
+      {
+        sessionId,
+        cwd,
+        additionalDirectories: (session.additionalDirectories ?? [])
+          .flatMap((directory) => {
+            const normalized = boundedOpaqueValue(directory, 4_096);
+            return normalized === undefined ? [] : [normalized];
+          })
+          .slice(0, 32),
+        title:
+          session.title === undefined || session.title === null
+            ? null
+            : boundedText(session.title, 1_024) || null,
+        updatedAt:
+          session.updatedAt === undefined || session.updatedAt === null
+            ? null
+            : boundedText(session.updatedAt, 128) || null,
+        importedThreadId: null,
+      },
+    ];
+  });
+}
+
+const boundedCursor = (cursor: string | null | undefined): string | null =>
+  cursor === undefined || cursor === null ? null : boundedText(cursor, 2_048) || null;
+
 export const listAcpRegistrySessions = Effect.fn("AcpRegistryProbe.listSessions")(
   function* (input: AcpRegistryManagementInput & { readonly cursor?: string }) {
     const runtime = yield* makeAcpRegistryManagementRuntime(input);
     const initialized = yield* runtime.initialize();
-    const listed = yield* runtime.listSessions(input.cursor);
-    const sessions = listed.sessions.slice(0, 256).flatMap((session) => {
-      const sessionId = boundedOpaqueValue(session.sessionId, 1_024);
-      const cwd = boundedOpaqueValue(session.cwd, 4_096);
-      if (sessionId === undefined || cwd === undefined) return [];
-      return [
-        {
-          sessionId,
-          cwd,
-          additionalDirectories: (session.additionalDirectories ?? [])
-            .flatMap((directory) => {
-              const normalized = boundedOpaqueValue(directory, 4_096);
-              return normalized === undefined ? [] : [normalized];
-            })
-            .slice(0, 32),
-          title:
-            session.title === undefined || session.title === null
-              ? null
-              : boundedText(session.title, 1_024) || null,
-          updatedAt:
-            session.updatedAt === undefined || session.updatedAt === null
-              ? null
-              : boundedText(session.updatedAt, 128) || null,
-          importedThreadId: null,
-        },
-      ];
-    });
+    const listed = yield* runtime.listSessions(
+      input.cursor === undefined ? undefined : { cursor: input.cursor },
+    );
     return AcpRegistryListSessionsResult.make({
-      sessions,
-      nextCursor:
-        listed.nextCursor === undefined || listed.nextCursor === null
-          ? null
-          : boundedText(listed.nextCursor, 2_048) || null,
+      sessions: normalizeAcpRegistrySessions(listed.sessions.slice(0, 256)),
+      nextCursor: boundedCursor(listed.nextCursor),
       canLoad: initialized.agentCapabilities?.loadSession === true,
       canResume: initialized.agentCapabilities?.sessionCapabilities?.resume != null,
       canDelete: initialized.agentCapabilities?.sessionCapabilities?.delete != null,
@@ -638,6 +647,45 @@ export const listAcpRegistrySessions = Effect.fn("AcpRegistryProbe.listSessions"
             new AcpRegistryOperationError({
               reason: "probe_failed",
               message: "The ACP session list request timed out.",
+            }),
+          ),
+      }),
+      Effect.mapError((error) => managementFailure("list", error)),
+    ),
+);
+
+const SCAN_PAGES_PER_CWD = 16;
+
+/** Lists sessions for several working directories through one agent process. */
+export const scanAcpRegistrySessions = Effect.fn("AcpRegistryProbe.scanSessions")(
+  function* (
+    input: AcpRegistryManagementInput & { readonly cwds: Arr.NonEmptyReadonlyArray<string> },
+  ) {
+    const runtime = yield* makeAcpRegistryManagementRuntime(input);
+    const sessions: Array<AcpRegistrySession> = [];
+    for (const cwd of input.cwds) {
+      const seenCursors = new Set<string>();
+      let cursor: string | null = null;
+      for (let page = 0; page < SCAN_PAGES_PER_CWD; page++) {
+        const listed = yield* runtime.listSessions(cursor === null ? { cwd } : { cwd, cursor });
+        sessions.push(...normalizeAcpRegistrySessions(listed.sessions));
+        cursor = boundedCursor(listed.nextCursor);
+        if (cursor === null || seenCursors.has(cursor)) break;
+        seenCursors.add(cursor);
+      }
+    }
+    return sessions;
+  },
+  (effect) =>
+    effect.pipe(
+      Effect.scoped,
+      Effect.timeoutOrElse({
+        duration: MANAGEMENT_TIMEOUT,
+        orElse: () =>
+          Effect.fail(
+            new AcpRegistryOperationError({
+              reason: "probe_failed",
+              message: "The ACP session scan timed out.",
             }),
           ),
       }),

@@ -109,6 +109,12 @@ const supportsSessionLifecycle = process.env.T3_ACP_SESSION_LIFECYCLE === "1";
 const supportsAcpMcp = process.env.T3_ACP_MCP_ACP === "1";
 const supportsV2Management = process.env.T3_ACP_V2_MANAGEMENT === "1";
 const omitSessionListHandler = process.env.T3_ACP_OMIT_SESSION_LIST_HANDLER === "1";
+const listedSessionsFixture = process.env.T3_ACP_LISTED_SESSIONS
+  ? (JSON.parse(process.env.T3_ACP_LISTED_SESSIONS) as {
+      readonly pageSize: number;
+      readonly sessions: ReadonlyArray<{ readonly sessionId: string; readonly cwd: string }>;
+    })
+  : undefined;
 const advertisedAuthMethodId = process.env.T3_ACP_AUTH_METHOD_ID?.trim();
 const initializeAuthMethodId =
   advertisedAuthMethodId ?? (supportsSessionLifecycle ? "test" : undefined);
@@ -786,6 +792,17 @@ const program = Effect.gen(function* () {
     yield* agent.handleListSessions((request) =>
       Effect.gen(function* () {
         yield* requireAuthentication();
+        if (listedSessionsFixture !== undefined) {
+          const matching = listedSessionsFixture.sessions.filter(
+            (session) => request.cwd === undefined || session.cwd === request.cwd,
+          );
+          const offset = Number(request.cursor ?? "0");
+          const end = offset + listedSessionsFixture.pageSize;
+          return {
+            sessions: matching.slice(offset, end),
+            ...(end < matching.length ? { nextCursor: String(end) } : {}),
+          };
+        }
         return {
           sessions: [
             {

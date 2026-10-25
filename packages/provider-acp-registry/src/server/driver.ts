@@ -50,6 +50,7 @@ import {
   listAcpRegistryProviders,
   logoutAcpRegistry,
   probeAcpRegistryConfiguration,
+  scanAcpRegistrySessions,
   setAcpRegistryProvider,
 } from "./probe.ts";
 import * as AcpRegistrySupport from "./AcpRegistrySupport.ts";
@@ -500,6 +501,8 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
       continuationKey: continuationIdentity.continuationKey,
     };
     const effectiveConfig = { ...config, enabled } satisfies AcpRegistrySettings;
+    const backgroundProbeAgentKey =
+      effectiveConfig.source === "local" ? `local:${instanceId}` : effectiveConfig.agentId;
     const processEnvironment = yield* mergeProviderInstanceEnvironment(
       environment,
       hostEnvironment,
@@ -642,9 +645,7 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
         const publishEnrichment = (
           Option.isSome(runtimeCoordinator)
             ? runtimeCoordinator.value.runBackgroundProbe(
-                effectiveConfig.source === "local"
-                  ? `local:${instanceId}`
-                  : effectiveConfig.agentId,
+                backgroundProbeAgentKey,
                 enrichProviderCached(snapshot),
               )
             : enrichProviderCached(snapshot).pipe(Effect.map(Option.some))
@@ -816,6 +817,20 @@ export const AcpRegistryDriver: ProviderDriver<AcpRegistrySettings, AcpRegistryD
               ...(cursor === undefined ? {} : { cursor }),
             }),
           ),
+        scanSessions: (cwds) => {
+          const scan = scanAcpRegistrySessions({
+            instanceId,
+            settings: effectiveConfig,
+            cwd: cwds[0],
+            environment: processEnvironment,
+            cwds,
+          });
+          return provideAcpManagementServices(
+            Option.isSome(runtimeCoordinator)
+              ? runtimeCoordinator.value.runBackgroundProbe(backgroundProbeAgentKey, scan)
+              : Effect.asSome(scan),
+          );
+        },
         deleteSession: ({ cwd, sessionId }) =>
           provideAcpManagementServices(
             deleteAcpRegistrySession({

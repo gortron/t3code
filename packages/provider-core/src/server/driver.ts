@@ -7,6 +7,7 @@ import type {
   AcpRegistryListSessionsResult,
   AcpRegistryListProvidersResult,
   AcpRegistryOperationError,
+  AcpRegistrySession,
   AcpRegistrySetProviderInput,
   ProviderDriverKind,
   ProviderInstanceEnvironment,
@@ -14,7 +15,9 @@ import type {
   ServerProvider,
   ServerProviderWorkspaceSnapshot,
 } from "@t3tools/contracts";
+import type * as Arr from "effect/Array";
 import type * as Effect from "effect/Effect";
+import type * as Option from "effect/Option";
 import type * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
@@ -64,6 +67,10 @@ export interface ProviderInstance {
       readonly cwd: string;
       readonly cursor?: string;
     }) => Effect.Effect<AcpRegistryListSessionsResult, AcpRegistryOperationError>;
+    /** `None` when a foreground start of the same agent pre-empted the scan. */
+    readonly scanSessions: (
+      cwds: Arr.NonEmptyReadonlyArray<string>,
+    ) => Effect.Effect<Option.Option<ReadonlyArray<AcpRegistrySession>>, AcpRegistryOperationError>;
     readonly logout: (cwd: string) => Effect.Effect<void, AcpRegistryOperationError>;
     readonly deleteSession: (input: {
       readonly cwd: string;

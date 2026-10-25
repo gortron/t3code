@@ -7,6 +7,7 @@ import { ProviderInstanceId } from "@t3tools/contracts";
 import { AcpRegistrySettings } from "@t3tools/provider-acp-registry/settings";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Schema from "effect/Schema";
 import * as EffectAcpErrors from "effect-acp/errors";
 
@@ -18,6 +19,7 @@ import {
   logoutAcpRegistry,
   normalizeAcpRegistryAuthMethods,
   normalizeAcpRegistryCommands,
+  scanAcpRegistrySessions,
 } from "@t3tools/provider-acp-registry/testing";
 import * as AcpRegistrySupport from "@t3tools/provider-acp-registry/server/AcpRegistrySupport";
 
@@ -25,6 +27,30 @@ const instanceId = ProviderInstanceId.make("acpRegistry_codex");
 const __dirname = NodePath.dirname(NodeURL.fileURLToPath(import.meta.url));
 const mockAgentPath = NodePath.join(__dirname, "../../scripts/acp-mock-agent.ts");
 const decodeSettings = Schema.decodeSync(AcpRegistrySettings);
+
+const mockAgentCatalog = (env: Record<string, string>) =>
+  AcpRegistrySupport.AcpRegistryCatalog.of({
+    search: () => Effect.die("unused search"),
+    prepare: () => Effect.die("unused prepare"),
+    inspect: () => Effect.die("unused inspect"),
+    uninstallManagedBinary: () => Effect.die("unused uninstall"),
+    resolve: () =>
+      Effect.succeed({
+        agent: {
+          id: "mock-agent",
+          name: "Mock Agent",
+          version: "1.0.0",
+          description: "ACP session management test agent",
+          distribution: { npx: { package: "mock-agent@1.0.0" } },
+        },
+        distribution: "npx" as const,
+        spawn: {
+          command: "node",
+          args: [mockAgentPath],
+          env: { ...process.env, ...env },
+        },
+      }),
+  });
 
 describe("ACP Registry probe", () => {
   it("returns advertised auth methods and de-duplicated models", () => {
@@ -319,31 +345,9 @@ describe("ACP Registry probe", () => {
   });
 
   it.effect("lists native sessions and logs out through generic ACP lifecycle methods", () => {
-    const catalog = AcpRegistrySupport.AcpRegistryCatalog.of({
-      search: () => Effect.die("unused search"),
-      prepare: () => Effect.die("unused prepare"),
-      inspect: () => Effect.die("unused inspect"),
-      uninstallManagedBinary: () => Effect.die("unused uninstall"),
-      resolve: () =>
-        Effect.succeed({
-          agent: {
-            id: "mock-agent",
-            name: "Mock Agent",
-            version: "1.0.0",
-            description: "ACP session management test agent",
-            distribution: { npx: { package: "mock-agent@1.0.0" } },
-          },
-          distribution: "npx" as const,
-          spawn: {
-            command: "node",
-            args: [mockAgentPath],
-            env: {
-              ...process.env,
-              T3_ACP_SESSION_LIFECYCLE: "1",
-              T3_ACP_AUTH_METHOD_ID: "mock-login",
-            },
-          },
-        }),
+    const catalog = mockAgentCatalog({
+      T3_ACP_SESSION_LIFECYCLE: "1",
+      T3_ACP_AUTH_METHOD_ID: "mock-login",
     });
     const input = {
       instanceId,
@@ -373,6 +377,76 @@ describe("ACP Registry probe", () => {
       Effect.scoped,
     );
   });
+
+  it.effect("scans every project root through one initialized agent process", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-acp-scan-" });
+      const projectA = NodePath.join(root, "a");
+      const projectB = NodePath.join(root, "b");
+      yield* fs.makeDirectory(projectA);
+      yield* fs.makeDirectory(projectB);
+      const requestLog = NodePath.join(root, "requests.jsonl");
+      const catalog = mockAgentCatalog({
+        T3_ACP_SESSION_LIFECYCLE: "1",
+        T3_ACP_REQUEST_LOG_PATH: requestLog,
+        T3_ACP_LISTED_SESSIONS: JSON.stringify({
+          pageSize: 2,
+          sessions: [
+            { sessionId: "a-1", cwd: projectA },
+            { sessionId: "a-2", cwd: projectA },
+            { sessionId: "a-3", cwd: projectA },
+            { sessionId: "b-1", cwd: projectB },
+            { sessionId: "elsewhere-1", cwd: root },
+          ],
+        }),
+      });
+
+      const sessions = yield* scanAcpRegistrySessions({
+        instanceId,
+        settings: decodeSettings({ agentId: "mock-agent" }),
+        cwd: projectA,
+        environment: process.env,
+        cwds: [projectA, projectB],
+      }).pipe(Effect.provideService(AcpRegistrySupport.AcpRegistryCatalog, catalog));
+
+      expect(sessions.map((session) => [session.sessionId, session.cwd])).toEqual([
+        ["a-1", projectA],
+        ["a-2", projectA],
+        ["a-3", projectA],
+        ["b-1", projectB],
+      ]);
+      const requests = (yield* fs.readFileString(requestLog))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { method?: string; params?: unknown });
+      expect(requests.filter((request) => request.method === "initialize")).toHaveLength(1);
+      expect(
+        requests
+          .filter((request) => request.method === "session/list")
+          .map((request) => request.params),
+      ).toEqual([{ cwd: projectA }, { cwd: projectA, cursor: "2" }, { cwd: projectB }]);
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
+
+  it.effect("reports a session scan against an agent without session listing as unsupported", () =>
+    Effect.gen(function* () {
+      const error = yield* scanAcpRegistrySessions({
+        instanceId,
+        settings: decodeSettings({ agentId: "mock-agent" }),
+        cwd: process.cwd(),
+        environment: process.env,
+        cwds: [process.cwd()],
+      }).pipe(
+        Effect.provideService(
+          AcpRegistrySupport.AcpRegistryCatalog,
+          mockAgentCatalog({ T3_ACP_OMIT_SESSION_LIST_HANDLER: "1" }),
+        ),
+        Effect.flip,
+      );
+      expect(error.reason).toBe("session_list_unsupported");
+    }).pipe(Effect.provide(NodeServices.layer), Effect.scoped),
+  );
 
   it("distinguishes authentication failures from generic probe failures", () => {
     const advertised = normalizeAcpRegistryAuthMethods([
