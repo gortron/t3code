@@ -26,6 +26,7 @@ import {
   TurnItemId,
   type ThreadPullRequestLink,
 } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -557,6 +558,164 @@ it.effect.each([
         [],
       );
     }).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const)("%s finds the threads that own native sessions", ([, layer]) =>
+  Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    const now = yield* DateTime.now;
+    const otherInstanceId = ProviderInstanceId.make("codex-other");
+    const createThread = (id: string) => {
+      const threadId = ThreadId.make(id);
+      const thread = {
+        createdBy: "user" as const,
+        creationSource: "web" as const,
+        id: threadId,
+        projectId: ProjectId.make("project:native-owners"),
+        title: id,
+        providerInstanceId,
+        modelSelection,
+        runtimeMode: "full-access" as const,
+        interactionMode: "default" as const,
+        branch: null,
+        worktreePath: null,
+        activeProviderThreadId: null,
+        lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        archivedAt: null,
+        settledOverride: null,
+        settledAt: null,
+        lastVisitedAt: null,
+        deletedAt: null,
+      };
+      return store
+        .apply({
+          id: EventId.make(`event:${id}:created`),
+          type: "thread.created",
+          threadId,
+          occurredAt: now,
+          payload: thread,
+        })
+        .pipe(Effect.as(thread));
+    };
+    const bindNativeSession = (input: {
+      readonly threadId: ThreadId;
+      readonly providerThreadId: ProviderThreadId;
+      readonly nativeId: string;
+      readonly instanceId?: ProviderInstanceId;
+    }) =>
+      store.apply({
+        id: EventId.make(`event:${input.providerThreadId}:updated`),
+        type: "provider-thread.updated",
+        threadId: input.threadId,
+        driver,
+        occurredAt: now,
+        payload: {
+          id: input.providerThreadId,
+          driver,
+          providerInstanceId: input.instanceId ?? providerInstanceId,
+          providerSessionId: null,
+          appThreadId: input.threadId,
+          ownerNodeId: null,
+          nativeThreadRef: { driver, nativeId: input.nativeId, strength: "strong" },
+          nativeConversationHeadRef: null,
+          status: "idle",
+          firstRunOrdinal: null,
+          lastRunOrdinal: null,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    const derivedProviderThread = (nativeThreadId: string) =>
+      IdAllocator.deriveProviderThread({ driver, providerInstanceId, nativeThreadId });
+
+    const created = yield* createThread("thread:native-owners:created");
+    yield* bindNativeSession({
+      threadId: created.id,
+      providerThreadId: ProviderThreadId.make("provider-thread:random"),
+      nativeId: "session-created",
+    });
+    const imported = yield* createThread("thread:native-owners:imported");
+    yield* bindNativeSession({
+      threadId: imported.id,
+      providerThreadId: derivedProviderThread("session-imported"),
+      nativeId: "session-imported",
+    });
+    const rolledBack = yield* createThread("thread:native-owners:rolled-back");
+    yield* bindNativeSession({
+      threadId: rolledBack.id,
+      providerThreadId: derivedProviderThread("session-original"),
+      nativeId: "session-replacement",
+    });
+    const deleted = yield* createThread("thread:native-owners:deleted");
+    yield* bindNativeSession({
+      threadId: deleted.id,
+      providerThreadId: derivedProviderThread("session-deleted"),
+      nativeId: "session-deleted",
+    });
+    yield* bindNativeSession({
+      threadId: deleted.id,
+      providerThreadId: ProviderThreadId.make("provider-thread:reowned-before-delete"),
+      nativeId: "session-reowned",
+    });
+    yield* bindNativeSession({
+      threadId: created.id,
+      providerThreadId: ProviderThreadId.make("provider-thread:reowned-live"),
+      nativeId: "session-reowned",
+    });
+    yield* store.apply({
+      id: EventId.make("event:thread:native-owners:deleted:deleted"),
+      type: "thread.deleted",
+      threadId: deleted.id,
+      occurredAt: now,
+      payload: { ...deleted, deletedAt: now },
+    });
+    const otherInstance = yield* createThread("thread:native-owners:other-instance");
+    yield* bindNativeSession({
+      threadId: otherInstance.id,
+      providerThreadId: ProviderThreadId.make("provider-thread:other-instance"),
+      nativeId: "session-other-instance",
+      instanceId: otherInstanceId,
+    });
+
+    const owners = yield* store.getNativeThreadOwners({
+      driver,
+      providerInstanceId,
+      nativeThreadIds: [
+        "session-created",
+        "session-imported",
+        "session-original",
+        "session-replacement",
+        "session-deleted",
+        "session-reowned",
+        "session-other-instance",
+        "session-unknown",
+      ],
+    });
+    assert.deepEqual(Object.fromEntries(owners), {
+      "session-created": { threadId: created.id, deleted: false },
+      "session-imported": { threadId: imported.id, deleted: false },
+      "session-original": { threadId: rolledBack.id, deleted: false },
+      "session-replacement": { threadId: rolledBack.id, deleted: false },
+      "session-deleted": { threadId: deleted.id, deleted: true },
+      "session-reowned": { threadId: created.id, deleted: false },
+    });
+    assert.equal(
+      (yield* store.getNativeThreadOwners({
+        driver: ProviderDriverKind.make("claudeAgent"),
+        providerInstanceId,
+        nativeThreadIds: ["session-created"],
+      })).size,
+      0,
+    );
+  }).pipe(Effect.provide(layer)),
 );
 
 const addOrphanedRecoveryCandidate = Effect.fn("addOrphanedRecoveryCandidate")(function* (

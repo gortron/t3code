@@ -70,6 +70,7 @@ import {
   TurnItemId,
   NodeId,
   ProviderInstanceId,
+  type ProviderDriverKind,
 } from "@t3tools/contracts";
 import {
   createOrchestrationV2TurnItemVisibility,
@@ -79,6 +80,7 @@ import {
   deriveBlockedOnThreadWait,
   derivePendingBackgroundWork,
 } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -184,6 +186,56 @@ export type ProjectionThreadPullRequests = Pick<
   OrchestrationV2AppThread,
   "id" | "projectId" | "lineage" | "settledOverride" | "settledAt" | "pullRequests"
 >;
+
+export interface ProjectionNativeThreadOwner {
+  readonly threadId: ThreadId;
+  readonly deleted: boolean;
+}
+
+export interface ProjectionNativeThreadOwnersInput {
+  readonly driver: ProviderDriverKind;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly nativeThreadIds: ReadonlyArray<string>;
+}
+
+// A rollback swaps the payload's native id but keeps the row id derived from
+// the original session, so a session is owned through either one.
+function collectNativeThreadOwners(
+  input: ProjectionNativeThreadOwnersInput,
+  rows: Iterable<{
+    readonly providerThreadId: string;
+    readonly threadId: ThreadId;
+    readonly nativeId: string | null;
+    readonly deleted: boolean;
+  }>,
+): ReadonlyMap<string, ProjectionNativeThreadOwner> {
+  const requested = new Set(input.nativeThreadIds);
+  const byDerivedId = new Map<string, string>(
+    input.nativeThreadIds.map((nativeThreadId) => [
+      IdAllocator.deriveProviderThread({
+        driver: input.driver,
+        providerInstanceId: input.providerInstanceId,
+        nativeThreadId,
+      }),
+      nativeThreadId,
+    ]),
+  );
+  const owners = new Map<string, ProjectionNativeThreadOwner>();
+  for (const row of rows) {
+    const matched = [
+      row.nativeId !== null && requested.has(row.nativeId) ? row.nativeId : undefined,
+      byDerivedId.get(row.providerThreadId),
+    ];
+    for (const nativeThreadId of matched) {
+      if (nativeThreadId === undefined) continue;
+      const existing = owners.get(nativeThreadId);
+      if (existing === undefined || (existing.deleted && !row.deleted)) {
+        owners.set(nativeThreadId, { threadId: row.threadId, deleted: row.deleted });
+      }
+    }
+  }
+  return owners;
+}
 
 export type ProjectionSettlementCandidate = Pick<
   OrchestrationV2ThreadShell,
@@ -486,6 +538,10 @@ export interface ProjectionStoreV2Shape {
     ReadonlyArray<{ readonly threadId: ThreadId; readonly worktreePath: string }>,
     ProjectionStoreV2Error
   >;
+  /** Threads that own the given native sessions, keyed by native session id. */
+  readonly getNativeThreadOwners: (
+    input: ProjectionNativeThreadOwnersInput,
+  ) => Effect.Effect<ReadonlyMap<string, ProjectionNativeThreadOwner>, ProjectionStoreV2Error>;
   readonly getTurnStartContext: (
     threadId: ThreadId,
     runId: RunId,
@@ -6213,6 +6269,56 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
       );
 
+    const getNativeThreadOwners: ProjectionStoreV2Shape["getNativeThreadOwners"] = (input) =>
+      input.nativeThreadIds.length === 0
+        ? Effect.succeed(new Map())
+        : sql<{
+            readonly provider_thread_id: string;
+            readonly thread_id: string;
+            readonly native_id: string | null;
+            readonly deleted: number;
+          }>`
+            SELECT
+              provider_thread.provider_thread_id,
+              provider_thread.thread_id,
+              json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId') AS native_id,
+              thread.thread_id IS NULL OR thread.deleted_at IS NOT NULL AS deleted
+            FROM orchestration_v2_projection_provider_threads AS provider_thread
+            LEFT JOIN orchestration_v2_projection_threads AS thread
+              ON thread.thread_id = provider_thread.thread_id
+            WHERE provider_thread.driver = ${input.driver}
+              AND provider_thread.provider_instance_id = ${input.providerInstanceId}
+              AND provider_thread.thread_id IS NOT NULL
+              AND (
+                json_extract(provider_thread.payload_json, '$.nativeThreadRef.nativeId')
+                  IN (SELECT value FROM json_each(${encodeIdList(input.nativeThreadIds)}))
+                OR provider_thread.provider_thread_id IN (
+                  SELECT value FROM json_each(${encodeIdList(
+                    input.nativeThreadIds.map((nativeThreadId) =>
+                      IdAllocator.deriveProviderThread({
+                        driver: input.driver,
+                        providerInstanceId: input.providerInstanceId,
+                        nativeThreadId,
+                      }),
+                    ),
+                  )})
+                )
+              )
+          `.pipe(
+            Effect.map((rows) =>
+              collectNativeThreadOwners(
+                input,
+                rows.map((row) => ({
+                  providerThreadId: row.provider_thread_id,
+                  threadId: ThreadId.make(row.thread_id),
+                  nativeId: row.native_id,
+                  deleted: row.deleted !== 0,
+                })),
+              ),
+            ),
+            Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+          );
+
     const shellThreadStateFromRow =
       /* Runs once per shell row; the enclosing snapshot or thread read owns the span. */
       Effect.fnUntraced(function* (input: {
@@ -6628,6 +6734,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSettlementCandidates: readOnReader(getSettlementCandidates),
       getThreadsWithPullRequests: readOnReader(getThreadsWithPullRequests),
       getThreadWorktreePaths: readOnReader(getThreadWorktreePaths),
+      getNativeThreadOwners: readOnReader(getNativeThreadOwners),
       getThreadProjection,
       getTurnStartContext: readOnReader(getTurnStartContext),
       getTurnStartHistory: readOnReader(getTurnStartHistory),
@@ -6801,6 +6908,28 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
               thread.worktreePath !== null
                 ? [{ threadId: thread.id, worktreePath: thread.worktreePath }]
                 : [],
+            ),
+          ),
+        ),
+      getNativeThreadOwners: (input) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            collectNativeThreadOwners(
+              input,
+              [...state.projections.values()].flatMap(({ thread, providerThreads }) =>
+                providerThreads
+                  .filter(
+                    (providerThread) =>
+                      providerThread.driver === input.driver &&
+                      providerThread.providerInstanceId === input.providerInstanceId,
+                  )
+                  .map((providerThread) => ({
+                    providerThreadId: providerThread.id,
+                    threadId: thread.id,
+                    nativeId: providerThread.nativeThreadRef?.nativeId ?? null,
+                    deleted: thread.deletedAt !== null,
+                  })),
+              ),
             ),
           ),
         ),
